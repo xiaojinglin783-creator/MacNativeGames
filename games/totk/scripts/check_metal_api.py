@@ -50,7 +50,7 @@ def audit(backend):
             # Discard string literals (including diagnostics); only active code counts.
             code = re.sub(r'"(?:\\.|[^"\\])*"', '""', result.stdout)
             if backend == 3:
-                bad = re.search(r'\b(?:MTL4\w*|MTLStage\w*|g_q4|newCommandAllocator\w*|newArgumentTableWithDescriptor|endCommandBuffer|beginCommandBufferWithAllocator)\b', code)
+                bad = re.search(r'\b(?:MTL4\w*|MTLStage\w*|MTLSamplerReductionMode|reductionMode|g_q4|newCommandAllocator\w*|newArgumentTableWithDescriptor|endCommandBuffer|beginCommandBufferWithAllocator)\b', code)
                 if bad:
                     raise RuntimeError(f'{source.relative_to(ROOT)}: Metal 4 API in Metal 3 branch: {bad[0]}')
     return len(sources)

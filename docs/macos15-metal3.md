@@ -125,3 +125,16 @@ not Objective-C types or Apple API availability. Tests never use personal game d
 | `games/totk/tests/metal3_backend/probe.m` | Real GPU host-binding smoke test, pending Mac execution |
 | `tests/test_metal_backend.py` | Selection boundaries, Make flags/isolation, shader-cache retargeting and API audits |
 | `README.md`, `docs/macos15-metal3.md` | Experimental status, commands, validation and limitations |
+
+## First macOS 15 compiler feedback
+
+The user ran the check with macOS 15.7.3, SDK 15.5 and Apple clang 17. The initial
+attempt stopped with six errors: the compressed-texture conversion used a blit
+protocol variable for compute commands, and sampler reduction API declarations
+were absent from SDK 15. The conversion now uses separately typed blit/compute
+variables, ending the compute encoder through the normal detachment helper.
+Metal 3 uses the default weighted-average sampler without referencing the newer
+reduction property. MIN/MAX reduction requests stop with an explicit error;
+correct shader emulation for those requests is still outstanding if the game
+uses them. No averaging approximation is silently substituted. Metal 4 retains
+its native reduction modes. A fresh Mac compile/GPU result is still required.

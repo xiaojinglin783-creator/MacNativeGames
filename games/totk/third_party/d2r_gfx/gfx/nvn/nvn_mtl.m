@@ -4149,14 +4149,17 @@ static void blk_transcode(id<MTLTexture> aux, const blk_wb *w) {
     enc_b_copy_texture_buffer(e, aux, w->slice, w->level, MTLOriginMake(0, 0, 0), MTLSizeMake(w->bx, w->by, 1), b, 0, row, size);
     M4_BARRIER([e barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice]);
 #if DM_NVN_M3
-    blit_close(); e = [g_cb computeCommandEncoder];
+    blit_close();
+    CENC ce = [g_cb computeCommandEncoder];
+#else
+    CENC ce = e;
 #endif
-    arg_table_compute(e, at); [e setComputePipelineState:ps];
+    arg_table_compute(ce, at); [ce setComputePipelineState:ps];
     [at setAddress:b.gpuAddress atIndex:0]; [at setAddress:pb.gpuAddress + po atIndex:1]; [at setAddress:ab.gpuAddress atIndex:2];
-    [e dispatchThreadgroups:MTLSizeMake((w->bx + 7) / 8, (w->by + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-    M4_BARRIER([e barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice]);
+    [ce dispatchThreadgroups:MTLSizeMake((w->bx + 7) / 8, (w->by + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    M4_BARRIER([ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionDevice]);
 #if DM_NVN_M3
-    [e endEncoding]; e = blit();
+    enc_c_end(ce); e = blit();
 #endif
     enc_b_copy_buffer_texture(e, ab, 0, arow, asize, MTLSizeMake(w->lw, w->lh, 1), w->dst, w->slice, w->level, MTLOriginMake(0, 0, 0));
     M4_BARRIER([e barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice]);
@@ -4185,14 +4188,17 @@ static void blk_decode(id<MTLTexture> aux, const blk_wb *w) {
     enc_b_copy_texture_buffer(e, aux, w->slice, w->level, MTLOriginMake(0, 0, w->plane), MTLSizeMake(w->bx, w->by, 1), b, 0, row, size);
     M4_BARRIER([e barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice]);
 #if DM_NVN_M3
-    blit_close(); e = [g_cb computeCommandEncoder];
+    blit_close();
+    CENC ce = [g_cb computeCommandEncoder];
+#else
+    CENC ce = e;
 #endif
-    arg_table_compute(e, at); [e setComputePipelineState:ps];
+    arg_table_compute(ce, at); [ce setComputePipelineState:ps];
     [at setAddress:b.gpuAddress atIndex:0]; [at setAddress:pb.gpuAddress + po atIndex:1]; [at setTexture:GPU_RESOURCE(v) atIndex:0];
-    [e dispatchThreadgroups:MTLSizeMake((w->bx + 7) / 8, (w->by + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-    M4_BARRIER([e barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice]);
+    [ce dispatchThreadgroups:MTLSizeMake((w->bx + 7) / 8, (w->by + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    M4_BARRIER([ce barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageBlit | MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice]);
 #if DM_NVN_M3
-    [e endEncoding];
+    enc_c_end(ce);
 #endif
     defer_obj_release(b); defer_obj_unref(v);
     static int once; if (!once++) MLOG("无 BC：渲染进 BC 贴图的块在 GPU 上解压进解压格式的贴图（首例 %lux%lu fmt %d）", (unsigned long)w->lw, (unsigned long)w->lh, w->fmt);
@@ -5521,7 +5527,14 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Calle
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
     d.borderColor = p.border[3] > 0.5f ? (p.border[0] > 0.5f ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorOpaqueBlack) : MTLSamplerBorderColorTransparentBlack;
     if (p.reduction > 2) die("sampler reduction filter %u unsupported", p.reduction);
+#if DM_NVN_M3
+    /* SDK 15 exposes only weighted-average filtering. That is the descriptor's
+       default. Do not silently replace MIN/MAX with averaging: it changes depth
+       reduction semantics and can corrupt visibility/shadow results. */
+    if (p.reduction != 0) die("Metal 3: sampler %d requests %s reduction; shader emulation is required on macOS 15", sid, p.reduction == 1 ? "MIN" : "MAX");
+#else
     d.reductionMode = (MTLSamplerReductionMode)p.reduction;   // TOTK: NVN AVERAGE/MIN/MAX = Metal WeightedAverage/Minimum/Maximum
+#endif
     d.supportArgumentBuffers = YES;
     id<MTLSamplerState> s = [g_dev newSamplerStateWithDescriptor:d];
     if (s) { g_sview[sid] = (void *)CFBridgingRetain(s); g_srid[sid] = s.gpuResourceID._impl; }
