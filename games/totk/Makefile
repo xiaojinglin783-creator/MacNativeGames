@@ -1,5 +1,31 @@
+.DEFAULT_GOAL := help
+# API selection is independent of the SDK maximum version. macOS 15 supports
+# the older API with Xcode 16; macOS 26+ keeps the original Metal 4 path.
+MACOS_MAJOR := $(firstword $(subst ., ,$(shell sw_vers -productVersion 2>/dev/null)))
+METAL_BACKEND ?= $(shell test "$(MACOS_MAJOR)" -ge 26 2>/dev/null && echo 4 || echo 3)
+ifeq ($(filter $(METAL_BACKEND),3 4),)
+$(error METAL_BACKEND must be 3 or 4)
+endif
+ifeq ($(METAL_BACKEND),3)
+MACOSX_DEPLOYMENT_TARGET := 15.0
+METALFX_FRAMEWORK :=
+else
+MACOSX_DEPLOYMENT_TARGET := 26.0
+METALFX_FRAMEWORK := -framework MetalFX
+endif
+export MACOSX_DEPLOYMENT_TARGET
+MACOS_FLAGS := -arch arm64 -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET) -DDM_NVN_M3=$(if $(filter 3,$(METAL_BACKEND)),1,0)
+
+.PHONY: FORCE_METAL_BACKEND
+build/metal-backend: FORCE_METAL_BACKEND
+	@mkdir -p build
+	@echo '$(METAL_BACKEND) $(MACOSX_DEPLOYMENT_TARGET)' | cmp -s - $@ || echo '$(METAL_BACKEND) $(MACOSX_DEPLOYMENT_TARGET)' > $@
+
+# A backend switch must relink even when the other API's cached objects are older.
+build/totk-native build/totk-native-v112 build/totk-native-v121 build/totk-native-v143: build/metal-backend
+
 GFX_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nvn/*.m third_party/d2r_gfx/gfx/nvn/*.S third_party/d2r_gfx/gfx/tex/*.c third_party/d2r_gfx/gfx/tex/*.m)
-GFX_OBJECTS := $(addprefix build/gfx/,$(addsuffix .o,$(GFX_SRC)))
+GFX_OBJECTS := $(addprefix build/gfx-metal$(METAL_BACKEND)/,$(addsuffix .o,$(GFX_SRC)))
 NATIVE_OPT ?= -O2
 GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include
 
@@ -28,7 +54,7 @@ modules:
 
 build/native_leaf_probe: scripts/native_leaf_probe.c
 	mkdir -p build
-	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror "$<" -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O2 -Wall -Wextra -Werror "$<" -o "$@"
 
 probe: build/native_leaf_probe
 	build/native_leaf_probe extracted/v0/elf/main.elf > analysis/native-leaf-probe.json
@@ -48,7 +74,7 @@ rewrite-main:
 
 build/native_call_probe: scripts/native_call_probe.c
 	mkdir -p build
-	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror "$<" -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O2 -Wall -Wextra -Werror "$<" -o "$@"
 
 build/native-call-fixture.bin: scripts/emit_native_call_fixture.py third_party/d2r/call_window.py
 	mkdir -p build
@@ -69,7 +95,7 @@ build/runtime_tables.h: scripts/prepare_runtime.py analysis/phase12-validation.j
 	"$(PY)" scripts/prepare_runtime.py
 
 build/totk-native: Makefile runtime/loader.c runtime/runtime.h runtime/game_patches.c runtime/game_patches.h runtime/game_version.h runtime/world_survey.c runtime/world_survey.h runtime/game_slot.c runtime/services.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/romfs.c runtime/romfs_path.h runtime/threads.c runtime/thread_compat.h runtime/thread_enter.S runtime/ipc.h runtime/audio_renderer.h runtime/audio_mixer.h runtime/audio_reverb.h runtime/audio_effects.h runtime/fs_host.h runtime/autoload.h runtime/autoload.c build/runtime_tables.h build/romfs_config.h build/shared_fonts_config.h runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/gamepad.m runtime/gamepad_layout.h runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/movie_host.h runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS)
-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal $(METALFX_FRAMEWORK) -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
 
 # Both warm-up lists come from the one shared shader list (docs/shader-list.md): pso_title.tsv is what the title screen,
 # its menu and the save list use, the only list the first frame waits for (nvn_mtl.m warm_start); pso_manifest.tsv the rest.
@@ -122,11 +148,11 @@ verify-boot: runtime
 
 
 
-GFX_HEADERS := $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h)
+GFX_HEADERS := $(wildcard third_party/d2r_gfx/gfx/nvn/*.inc third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h)
 
-build/gfx/%.o: % $(GFX_HEADERS) Makefile
+build/gfx-metal$(METAL_BACKEND)/%.o: % $(GFX_HEADERS) Makefile
 	@mkdir -p "$(dir $@)"
-	xcrun clang $(NATIVE_OPT) -g -Wall -Wextra $(GFX_FLAGS) -c "$<" -o "$@"
+	xcrun clang $(MACOS_FLAGS) $(NATIVE_OPT) -g -Wall -Wextra $(GFX_FLAGS) -c "$<" -o "$@"
 
 .PHONY: graphics-assets shader-inventory verify-shaders probe-thread
 graphics-assets:
@@ -140,7 +166,7 @@ verify-shaders:
 	"$(PY)" scripts/verify_shader_compilation.py
 
 build/thread-probe: scripts/thread_probe.c runtime/threads.c runtime/thread_compat.h runtime/thread_enter.S
-	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn/include scripts/thread_probe.c runtime/threads.c runtime/thread_enter.S -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn/include scripts/thread_probe.c runtime/threads.c runtime/thread_enter.S -o "$@"
 
 probe-thread: build/thread-probe
 	build/thread-probe > analysis/thread-probe.json
@@ -179,17 +205,17 @@ probe-fp64-fallback:
 	python3 scripts/verify_fp64_fallback.py
 .PHONY: probe-vertex-i2f
 probe-vertex-i2f:
-	xcrun clang -fobjc-arc tests/vertex_i2f/probe.m -framework Metal -framework Foundation -o build/vertex-i2f-probe
+	xcrun clang $(MACOS_FLAGS) -fobjc-arc tests/vertex_i2f/probe.m -framework Metal -framework Foundation -o build/vertex-i2f-probe
 	$(GAME_SLOT_RUN) build/vertex-i2f-probe
 .PHONY: clock-ocr-tool probe-game-clock
 clock-ocr-tool:
-	xcrun clang -fobjc-arc scripts/diag/read_game_clock.m -framework Foundation -framework Vision -framework ImageIO -framework CoreGraphics -o build/read-game-clock
+	xcrun clang $(MACOS_FLAGS) -fobjc-arc scripts/diag/read_game_clock.m -framework Foundation -framework Vision -framework ImageIO -framework CoreGraphics -o build/read-game-clock
 probe-game-clock: clock-ocr-tool
 	python3 scripts/diag/check_game_clock.py
 # On-screen FPS counter: glyph pixels, bounds and present-rate measurement (CPU only).
 probe-fps-overlay:
 	@mkdir -p build/tests
-	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/fps_overlay/probe.c third_party/d2r_gfx/gfx/nvn/fps_overlay.c third_party/d2r_gfx/gfx/nvn/totk_sysload.c -framework IOKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -o build/tests/fps_overlay_probe
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/fps_overlay/probe.c third_party/d2r_gfx/gfx/nvn/fps_overlay.c third_party/d2r_gfx/gfx/nvn/totk_sysload.c -framework IOKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -o build/tests/fps_overlay_probe
 	build/tests/fps_overlay_probe
 .PHONY: probe-audio
 probe-audio: runtime
@@ -209,7 +235,7 @@ probe-memory: runtime
 
 .PHONY: probe-input
 build/input-probe: scripts/input_probe.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/autoload.h runtime/runtime.h
-	xcrun clang -std=c11 -O1 -Wall -Wextra -Werror scripts/input_probe.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O1 -Wall -Wextra -Werror scripts/input_probe.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c -o "$@"
 probe-input: build/input-probe
 	build/input-probe > analysis/native-input-probe.json
 	@cat analysis/native-input-probe.json
@@ -221,13 +247,13 @@ probe-input: build/input-probe
 .PHONY: probe-movie
 # Host VP9 movie::Decoder (runtime/movie_host.c) against ffmpeg's own VP9 decode of the blood-moon cutscene, frame by frame.
 build/movie-probe: scripts/movie_probe.c runtime/movie_host.c runtime/movie_host.h runtime/runtime.h
-	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -I/opt/homebrew/opt/libvpx/include scripts/movie_probe.c runtime/movie_host.c /opt/homebrew/opt/libvpx/lib/libvpx.a -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O2 -Wall -Wextra -Werror -I/opt/homebrew/opt/libvpx/include scripts/movie_probe.c runtime/movie_host.c /opt/homebrew/opt/libvpx/lib/libvpx.a -o "$@"
 probe-movie: build/movie-probe
 	python3 scripts/movie_probe_inputs.py analysis/movie-probe
 	build/movie-probe analysis/movie-probe/frames.ivf analysis/movie-probe/reference.nv12 $$(cat analysis/movie-probe/meta.txt) buffers | tee analysis/movie-probe.json
 	build/movie-probe analysis/movie-probe/frames.ivf analysis/movie-probe/reference.nv12 $$(cat analysis/movie-probe/meta.txt) paced | tee -a analysis/movie-probe.json
 build/autoload-probe: scripts/autoload_probe.c runtime/autoload.c runtime/autoload.h runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/runtime.h
-	xcrun clang -std=c11 -O1 -Wall -Wextra -Werror scripts/autoload_probe.c runtime/autoload.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O1 -Wall -Wextra -Werror scripts/autoload_probe.c runtime/autoload.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c -o "$@"
 probe-autoload: build/autoload-probe
 	TOTK_AUTOLOAD=1 TOTK_AUTOLOAD_PERIOD_MS=400 build/autoload-probe press
 	TOTK_AUTOLOAD=1 TOTK_AUTOLOAD_PERIOD_MS=400 build/autoload-probe nosave
@@ -269,14 +295,14 @@ graphics-tools:
 # return the other one, safe math keeps NaN * 0 = NaN, a colour attachment the fragment function does not write is kept.
 probe-metal-semantics:
 	@mkdir -p build analysis
-	xcrun clang -fobjc-arc -O1 -Wall -Wextra -Werror tests/metal_semantics/probe.m -framework Metal -framework Foundation -o build/metal-semantics-probe
+	xcrun clang $(MACOS_FLAGS) -fobjc-arc -O1 -Wall -Wextra -Werror tests/metal_semantics/probe.m -framework Metal -framework Foundation -o build/metal-semantics-probe
 	$(GAME_SLOT_RUN) build/metal-semantics-probe | tee analysis/metal-semantics-probe.log
 
 .PHONY: probe-bc1astc
 # BC1 -> ASTC 4x4 transcoding for GPUs without BC (iPhone A15/A16), checked through Metal's ASTC decoder; CPU and GPU agree.
 probe-bc1astc:
 	@mkdir -p build
-	xcrun clang -fobjc-arc -O1 -Wall -Wextra -Werror -Wno-unused-parameter tests/bc1astc/probe.m third_party/d2r_gfx/gfx/tex/nvn_bc1astc.c -framework Metal -framework Foundation -o build/bc1astc-probe
+	xcrun clang $(MACOS_FLAGS) -fobjc-arc -O1 -Wall -Wextra -Werror -Wno-unused-parameter tests/bc1astc/probe.m third_party/d2r_gfx/gfx/tex/nvn_bc1astc.c -framework Metal -framework Foundation -o build/bc1astc-probe
 	build/bc1astc-probe | tee analysis/probe-bc1astc.json
 
 .PHONY: probe-gpu-bctc
@@ -284,7 +310,7 @@ probe-bc1astc:
 # compared with bcdec (kernel decoders exact, smooth-block PSNR, dual-plane ASTC on representable blocks).
 probe-gpu-bctc:
 	@mkdir -p build analysis
-	xcrun clang -fobjc-arc -O1 -Wall -Wextra -Werror -Wno-unused-parameter tests/bctc/probe.m -framework Metal -framework Foundation -o build/bctc-probe
+	xcrun clang $(MACOS_FLAGS) -fobjc-arc -O1 -Wall -Wextra -Werror -Wno-unused-parameter tests/bctc/probe.m -framework Metal -framework Foundation -o build/bctc-probe
 	build/bctc-probe | tee analysis/probe-gpu-bctc.json
 
 .PHONY: probe-metalfx-interp
@@ -293,21 +319,21 @@ probe-gpu-bctc:
 # interpolated frame at several sizes; negative controls with flipped / zero / wrongly scaled motion. Run alone (GPU).
 probe-metalfx-interp:
 	@mkdir -p build analysis
-	xcrun clang -fobjc-arc -O1 -Wall -Wextra -Werror -Wno-unused-parameter tests/metalfx_interp/probe.m -framework Metal -framework MetalFX -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -o build/metalfx-interp-probe
+	xcrun clang $(MACOS_FLAGS) -fobjc-arc -O1 -Wall -Wextra -Werror -Wno-unused-parameter tests/metalfx_interp/probe.m -framework Metal $(METALFX_FRAMEWORK) -framework Foundation -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers -o build/metalfx-interp-probe
 	$(GAME_SLOT_RUN) build/metalfx-interp-probe | tee analysis/metalfx-interp-probe.log
 
 .PHONY: probe-dirty-race
 # CPU only: dirty-page tracker, "set read-only" racing "unprotect before a host write" (from D2R Mobile ef9b1ff), with a negative control.
 probe-dirty-race:
 	@mkdir -p build analysis
-	xcrun clang -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-function -Ithird_party/d2r_gfx/gfx/nvn tests/dirty_race/probe.c -o build/dirty-race-probe
+	xcrun clang $(MACOS_FLAGS) -std=gnu11 -O1 -Wall -Wextra -Werror -Wno-unused-function -Ithird_party/d2r_gfx/gfx/nvn tests/dirty_race/probe.c -o build/dirty-race-probe
 	build/dirty-race-probe | tee analysis/dirty-race-probe.log
 
 .PHONY: probe-pool-index
 # CPU only: memory pool address index vs the old linear scan, with two negative controls and a timing line.
 probe-pool-index:
 	@mkdir -p build analysis
-	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/pool_index/probe.c -o build/pool-index-probe
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O2 -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/pool_index/probe.c -o build/pool-index-probe
 	build/pool-index-probe | tee analysis/pool-index-probe.log
 
 .PHONY: probe-reverb
@@ -315,7 +341,7 @@ probe-pool-index:
 probe-reverb:
 	@test -n "$(RYUJINX_AUDIO_REF)" || (echo 'Set RYUJINX_AUDIO_REF to the directory containing Ryujinx.Audio.dll'; exit 2)
 	tooling/dotnet/dotnet run --project tests/reverb/Reference.csproj -p:ReferenceRoot="$(RYUJINX_AUDIO_REF)" -- analysis/reverb-reference.bin analysis/limiter-reference.bin
-	xcrun clang -std=c11 -O1 -Wall -Wextra -Werror -Iruntime tests/reverb/probe.c runtime/audio_reverb.c -o build/reverb-probe
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O1 -Wall -Wextra -Werror -Iruntime tests/reverb/probe.c runtime/audio_reverb.c -o build/reverb-probe
 	build/reverb-probe analysis/reverb-reference.bin
 
 .PHONY: probe-audio-effects
@@ -325,7 +351,7 @@ probe-audio-effects: runtime probe-reverb
 # Host-only validation of live survey parsing and actor pointer traversal; no GPU or game.
 .PHONY: probe-world-survey
 build/world-survey-probe: scripts/world_survey_probe.c runtime/world_survey.c runtime/world_survey.h runtime/runtime.h
-	xcrun clang -std=c11 -O1 -Wall -Wextra -Werror scripts/world_survey_probe.c -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O1 -Wall -Wextra -Werror scripts/world_survey_probe.c -o "$@"
 probe-world-survey: build/world-survey-probe
 	build/world-survey-probe
 	@TOTK_PROBE_NEGATIVE=1 build/world-survey-probe > analysis/world-survey-negative.log 2>&1; test $$? -eq 1
@@ -338,7 +364,7 @@ build/v112/runtime_tables.h: scripts/prepare_runtime.py analysis/v112-port/phase
 build/v112/romfs_config.h: scripts/prepare_romfs_backend.py extracted/v112/romfs/index.json
 	"$(PY)" scripts/prepare_romfs_backend.py --version v112
 build/totk-native-v112: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v112/runtime_tables.h build/v112/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V112=1 -Ibuild/v112 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V112=1 -Ibuild/v112 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal $(METALFX_FRAMEWORK) -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
 runtime-v112: build/totk-native-v112 build/pso_manifest.tsv build/pso_title.tsv
 
 # Isolated 1.2.1 build (the same SDK modules as 1.0.0 and 1.1.2); never replace the validated v0 executable or generated headers.
@@ -348,7 +374,7 @@ build/v121/runtime_tables.h: scripts/prepare_runtime.py analysis/v121-port/phase
 build/v121/romfs_config.h: scripts/prepare_romfs_backend.py extracted/v121/romfs/index.json
 	"$(PY)" scripts/prepare_romfs_backend.py --version v121
 build/totk-native-v121: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v121/runtime_tables.h build/v121/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V121=1 -Ibuild/v121 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V121=1 -Ibuild/v121 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal $(METALFX_FRAMEWORK) -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
 runtime-v121: build/totk-native-v121 build/pso_manifest.tsv build/pso_title.tsv
 
 # Isolated 1.4.3 build; never replace the validated v0 executable or generated headers.
@@ -358,7 +384,7 @@ build/v143/runtime_tables.h: scripts/prepare_runtime.py analysis/v143-port/phase
 build/v143/romfs_config.h: scripts/prepare_romfs_backend.py extracted/v143/romfs/index.json
 	"$(PY)" scripts/prepare_romfs_backend.py --version v143
 build/totk-native-v143: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) build/v143/runtime_tables.h build/v143/romfs_config.h build/shared_fonts_config.h $(GFX_OBJECTS) Makefile
-	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V143=1 -Ibuild/v143 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches_v143.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DTOTK_GAME_V143=1 -Ibuild/v143 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_patches_v143.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal $(METALFX_FRAMEWORK) -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -o "$@"
 runtime-v143: build/totk-native-v143 build/pso_manifest.tsv build/pso_title.tsv
 
 # Keep standalone rendering probe binaries outside the source checkout.
@@ -366,14 +392,14 @@ RENDER_PROBE_DIR ?= $(abspath $(CURDIR)/../../../TOTK_build/rendering-probes)
 .PHONY: probe-texture-auto-layout
 $(RENDER_PROBE_DIR)/texture-auto-layout-probe: tests/texture_auto_layout/probe.c third_party/d2r_gfx/gfx/nvn/nvn_tex.c third_party/d2r_gfx/gfx/nvn/nvn_tex.h third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c
 	@mkdir -p "$(RENDER_PROBE_DIR)"
-	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/tex tests/texture_auto_layout/probe.c third_party/d2r_gfx/gfx/nvn/nvn_tex.c third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O2 -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn -Ithird_party/d2r_gfx/gfx/tex tests/texture_auto_layout/probe.c third_party/d2r_gfx/gfx/nvn/nvn_tex.c third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c -o "$@"
 probe-texture-auto-layout: $(RENDER_PROBE_DIR)/texture-auto-layout-probe
 	"$(RENDER_PROBE_DIR)/texture-auto-layout-probe"
 
 .PHONY: probe-depth16-clear
 $(RENDER_PROBE_DIR)/depth16-clear-probe: tests/depth16_clear/probe.m third_party/d2r_gfx/gfx/nvn/nvn_depth_clear.h
 	@mkdir -p "$(RENDER_PROBE_DIR)"
-	xcrun clang -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn tests/depth16_clear/probe.m -framework Metal -framework Foundation -o "$@"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O2 -Wall -Wextra -Werror -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn tests/depth16_clear/probe.m -framework Metal -framework Foundation -o "$@"
 probe-depth16-clear: $(RENDER_PROBE_DIR)/depth16-clear-probe
 	$(GAME_SLOT_RUN) "$(RENDER_PROBE_DIR)/depth16-clear-probe"
 
@@ -386,9 +412,9 @@ test-audio-effects:
 	@test -n "$(RYUJINX_AUDIO_REF)" || (echo 'Set RYUJINX_AUDIO_REF to the directory containing Ryujinx.Audio.dll'; exit 2)
 	mkdir -p "$(AUDIO_TEST_WORK)"
 	"$(DOTNET)" run --project tests/audio_effects/Reference.csproj -p:ReferenceRoot="$(RYUJINX_AUDIO_REF)" -p:BaseIntermediateOutputPath="$(AUDIO_TEST_WORK)/obj/" -p:OutputPath="$(AUDIO_TEST_WORK)/bin/" -- "$(AUDIO_TEST_WORK)/reference.bin"
-	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -ffp-contract=off -fsanitize=undefined -fno-sanitize-recover=all -Iruntime tests/audio_effects/probe.c runtime/audio_effects.c -o "$(AUDIO_TEST_WORK)/dsp-probe"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O1 -g -Wall -Wextra -Werror -ffp-contract=off -fsanitize=undefined -fno-sanitize-recover=all -Iruntime tests/audio_effects/probe.c runtime/audio_effects.c -o "$(AUDIO_TEST_WORK)/dsp-probe"
 	"$(AUDIO_TEST_WORK)/dsp-probe" "$(AUDIO_TEST_WORK)/reference.bin"
-	xcrun clang -std=c11 -O2 -g -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all -Iruntime tests/audio_effects/mixer_probe.c runtime/audio_effects.c runtime/audio_reverb.c -framework AudioToolbox -o "$(AUDIO_TEST_WORK)/mixer-probe"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O2 -g -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all -Iruntime tests/audio_effects/mixer_probe.c runtime/audio_effects.c runtime/audio_reverb.c -framework AudioToolbox -o "$(AUDIO_TEST_WORK)/mixer-probe"
 	"$(AUDIO_TEST_WORK)/mixer-probe" "$(AUDIO_TEST_WORK)/reference.bin"
 
 # Production Opus-wrapper regression checks; no game assets or audio device needed.
@@ -398,7 +424,18 @@ OPUS_SANITIZERS ?= address,undefined
 .PHONY: test-opus-codec
 test-opus-codec:
 	mkdir -p "$(OPUS_TEST_WORK)"
-	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=$(OPUS_SANITIZERS) -fno-sanitize-recover=all -I"$(OPUS_PREFIX)/include/opus" tests/opus_codec/probe.c "$(OPUS_PREFIX)/lib/libopus.a" -o "$(OPUS_TEST_WORK)/probe"
+	xcrun clang $(MACOS_FLAGS) -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=$(OPUS_SANITIZERS) -fno-sanitize-recover=all -I"$(OPUS_PREFIX)/include/opus" tests/opus_codec/probe.c "$(OPUS_PREFIX)/lib/libopus.a" -o "$(OPUS_TEST_WORK)/probe"
 	"$(OPUS_TEST_WORK)/probe"
 	@probe_status=0; "$(OPUS_TEST_WORK)/probe" --bad-range > "$(OPUS_TEST_WORK)/negative-range.log" 2>&1 || probe_status=$$?; test "$$probe_status" -eq 1
 	@grep -q 'Opus stream integrity' "$(OPUS_TEST_WORK)/negative-range.log"
+
+# No game, keys, extraction, save access or runtime-generated headers required.
+.PHONY: check-metal
+check-metal: $(GFX_OBJECTS)
+	xcrun clang $(MACOS_FLAGS) -fobjc-arc -std=gnu11 -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -Iruntime -fsyntax-only $(filter-out runtime/frontend_ios.m,$(wildcard runtime/*.m))
+
+.PHONY: probe-metal3-arguments
+probe-metal3-arguments:
+	@mkdir -p build/tests
+	xcrun clang -arch arm64 -mmacosx-version-min=15.0 -DDM_NVN_M3=1 -fobjc-arc -std=gnu11 -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn tests/metal3_backend/probe.m -framework Metal -framework Foundation -o build/tests/metal3-arguments
+	MTL_DEBUG_LAYER=1 build/tests/metal3-arguments

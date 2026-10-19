@@ -1,3 +1,18 @@
+#import <Metal/Metal.h>
+#include "nvn_backend.h"
+#if DM_NVN_M3
+#include "totk_mfx_up.h"
+#include <stdio.h>
+int mfxup_enabled(void) { return 0; }
+int mfxup_output_enabled(void) { return 0; }
+void mfxup_set(int on) { if (on) fprintf(stderr, "[mfx-up] Metal 3 uses the game's scaler and bilinear presentation\n"); }
+void mfxup_output_set(int on) { mfxup_set(on); }
+int mfxup_prepare(int ctx, id<MTLTexture> src, id<MTLTexture> dst, NSUInteger w, NSUInteger h, int mode) { (void)ctx; (void)src; (void)dst; (void)w; (void)h; (void)mode; return 0; }
+id<MTLTexture> mfxup_encode_ex(int ctx, CBUF cb, id<MTLTexture> src, NSUInteger iw, NSUInteger ih, id<MTLTexture> dst, NSUInteger ow, NSUInteger oh, int mode) { (void)ctx; (void)cb; (void)src; (void)iw; (void)ih; (void)dst; (void)ow; (void)oh; (void)mode; return nil; }
+id<MTLTexture> mfxup_encode(CBUF cb, id<MTLTexture> src, NSUInteger w, NSUInteger h) { (void)cb; (void)src; (void)w; (void)h; return nil; }
+id<MTLResidencySet> mfxup_residency(void) { return nil; }
+void mfxup_stats(int ctx, char *out, size_t n) { (void)ctx; snprintf(out, n, "off (Metal 3; bilinear fallback)"); }
+#else
 // TOTK: MetalFX spatial upscaling (TOTK_MFX_UPSCALE; not in D2R).
 // MFXUP_SCENE (iOS, handheld): with a scene render size below the canvas (TOTK_RENDER_RES=960x540 on the phone, canvas
 // 1280x720) the game's compose shader (0ac9a549: tone mapping, bloom, into the canvas) samples the scene bilinearly. The
@@ -233,3 +248,5 @@ void mfxup_stats(int ci, char *out, size_t n) {
     snprintf(out, n, "MetalFX 空间放大（%s）：%llu 次，未放大 %llu 次（其中等后台建放大器 %llu 次）（%lux%lu → %lux%lu）", g_name[ci], (unsigned long long)c->done,
              (unsigned long long)c->refused, (unsigned long long)c->waited, (unsigned long)k->in_w, (unsigned long)k->in_h, (unsigned long)k->out_w, (unsigned long)k->out_h);
 }
+
+#endif

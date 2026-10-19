@@ -71,8 +71,8 @@ int mtl_probe_tex_slots(void) {
             registry_lock();id __attribute__((objc_precise_lifetime)) sampler0=samp_by_id(61),sampler1=samp_by_id(62);registry_unlock();
             uint8_t expected[64*8*4]; int current=0,combined=0,separate=0,unbound=0;
             g_pass.serial++;args_dirty_all();
-            MTL4RenderPassDescriptor *rp=[MTL4RenderPassDescriptor new];rp.colorAttachments[0].texture=output;rp.colorAttachments[0].loadAction=MTLLoadActionClear;rp.colorAttachments[0].storeAction=MTLStoreActionStore;rp.renderTargetWidth=64;rp.renderTargetHeight=8;
-            id<MTL4RenderCommandEncoder> en=enc_r_begin(rp);enc_r_cull(en,MTLCullModeNone);enc_r_viewport(en,(MTLViewport){0,0,64,8,0,1});
+            RPD *rp=[RPD new];rp.colorAttachments[0].texture=output;rp.colorAttachments[0].loadAction=MTLLoadActionClear;rp.colorAttachments[0].storeAction=MTLStoreActionStore;rp.renderTargetWidth=64;rp.renderTargetHeight=8;
+            RENC en=enc_r_begin(rp);enc_r_cull(en,MTLCullModeNone);enc_r_viewport(en,(MTLViewport){0,0,64,8,0,1});
             p_bind_handles tex={.stage=1,.n=1,.h={51|(UINT64_C(61)<<20)}},samp={.stage=1,.n=1,.h={UINT64_C(61)<<20}};
             for(int stripe=0;stripe<16;stripe++) {
                 int shader=stripe==2?1:0;

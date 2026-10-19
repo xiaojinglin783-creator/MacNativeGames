@@ -344,9 +344,13 @@ int runtime_output_mode_cycle(void) {
     extern void dm_gfx_set_flag(const char *name, int value);
     int next_full, next_mfx;
     const char *name;
+#if DM_NVN_M3
+    next_full = !full; next_mfx = 0; name = next_full ? "原生 2K" : "关闭 2K";
+#else
     if (full) { next_full = 0; next_mfx = 0; name = "关闭 2K"; }
     else if (mfxup_output_enabled()) { next_full = 1; next_mfx = 0; name = "原生 2K"; }
     else { next_full = 0; next_mfx = 1; name = "MetalFX 2K"; }
+#endif
     if (full != next_full) runtime_output_res_toggle();
     dm_gfx_set_flag("mfx_output", next_mfx);
     dm_gfx_set_flag("mfx_upscale", next_mfx);

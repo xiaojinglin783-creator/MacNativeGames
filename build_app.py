@@ -23,7 +23,7 @@ Every intermediate file is in the work folder (default: "<game file folder>/TOTK
 what is already done and correct. Mac saves, shader cache and logs go to the user's Library folders; iOS keeps saves
 and the writable shader cache in the app's Documents container.
 
-Needs for Mac: macOS 26 or later on Apple silicon, the Xcode command line tools, Homebrew with
+Needs for Mac: macOS 15 or later on Apple silicon (Metal 3 on 15–25; Metal 4 on 26+), the Xcode command line tools, Homebrew with
     brew install opus libvpx python@3.14
 For iPhone/iPad: Xcode 26+ with iOS/Metal toolchains, plus xcodegen, CMake and Ninja.
 Optional: Xcode's Metal toolchain (xcodebuild -downloadComponent MetalToolchain) compiles the startup shaders into the
@@ -100,12 +100,25 @@ def check(what, got, want):
 
 
 # ---- prerequisites ----
+def metal_backend(major, requested='auto'):
+    """Select the build API without making SDK 26 a prerequisite on macOS 15."""
+    if major < 15:
+        raise BuildError('needs macOS 15 or later on Apple silicon')
+    selected = ('4' if major >= 26 else '3') if requested == 'auto' else requested
+    if selected not in ('3', '4'):
+        raise BuildError(f'unknown Metal backend: {selected}')
+    if selected == '4' and major < 26:
+        raise BuildError('Metal 4 requires macOS 26+; use --metal-backend 3 on macOS 15–25')
+    return selected
+
+
 def prerequisites(args):
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         raise BuildError('needs a Mac with Apple silicon')
     major = int(platform.mac_ver()[0].split('.')[0] or 0)
-    if major < 26:
-        raise BuildError(f'needs macOS 26 or later (Metal 4); this is macOS {platform.mac_ver()[0]}')
+    selected = metal_backend(major, getattr(args, 'metal_backend', 'auto'))
+    if getattr(args, 'platform', 'macos') == 'ios' and (major < 26 or selected == '3'):
+        raise BuildError('iOS builds still require macOS 26+ and the Metal 4 backend')
     if subprocess.run(['xcrun', '--find', 'clang'], capture_output=True).returncode:
         raise BuildError('the Xcode command line tools are missing: xcode-select --install')
     brew = Path('/opt/homebrew')
@@ -494,25 +507,27 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112'):
             logs/(version+'-'+script+'.log'), cwd=tree)
 
 
-def build_spirv_cross(tree, logs):
+def build_spirv_cross(tree, logs, *, deployment_target='26.0'):
     """The spirv-cross program with clang (the sources and flags of SPIRV-Cross's CMake Release build of it)."""
     src, out = tree / 'tooling/spirv-cross', tree / 'build/spirv-cross'
     objs = out / 'obj'
     objs.mkdir(parents=True, exist_ok=True)
 
     def compile_one(name):
-        run(['xcrun', 'clang++', *SPIRV_CROSS_FLAGS, '-c', src / name, '-o', objs / (name + '.o')],
+        run(['xcrun', 'clang++', *SPIRV_CROSS_FLAGS, f'-mmacosx-version-min={deployment_target}', '-c', src / name, '-o', objs / (name + '.o')],
             logs / 'spirv-cross' / (name + '.log'), quiet=False)
-    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+    with concurrent.futures.ThreadPoolExecutor(min(os.cpu_count() or 4, 4)) as pool:
         list(pool.map(compile_one, SPIRV_CROSS_SOURCES))
-    run(['xcrun', 'clang++', '-arch', 'arm64', *[objs / (n + '.o') for n in SPIRV_CROSS_SOURCES], '-o', out / 'spirv-cross'],
+    run(['xcrun', 'clang++', '-arch', 'arm64', f'-mmacosx-version-min={deployment_target}', *[objs / (n + '.o') for n in SPIRV_CROSS_SOURCES], '-o', out / 'spirv-cross'],
         logs / 'spirv-cross' / 'link.log', quiet=False)
 
 
-def step_shaders(tree, logs, *, version='v0'):
-    if not (tree / 'build/spirv-cross/spirv-cross').exists():
+def step_shaders(tree, logs, *, version='v0', deployment_target='26.0'):
+    target_stamp = tree / 'build/spirv-cross/deployment.txt'
+    if not (tree / 'build/spirv-cross/spirv-cross').exists() or not target_stamp.is_file() or target_stamp.read_text() != deployment_target:
         say('3/4 shaders: building SPIRV-Cross with clang')
-        build_spirv_cross(tree, logs)
+        build_spirv_cross(tree, logs, deployment_target=deployment_target)
+        target_stamp.write_text(deployment_target)
     # the shader translation service: a native program in this repository (no .NET needed to build or to play)
     translator = tree / 'prebuilt/macos-arm64/totk_xlate'
     want = (translator.parent / 'totk_xlate.sha256').read_text().strip()
@@ -568,7 +583,7 @@ def metal_compiler():
 METAL_FLAGS = ['-fmetal-math-mode=safe']
 
 
-def step_shader_libs(tree, logs, *, version='v0'):
+def step_shader_libs(tree, logs, *, version='v0', deployment_target='26.0'):
     """Compile the startup shaders ahead of time. Metal's own cache of shaders compiled at launch does not follow the
     app to a folder whose path has another length (step_warm_metal); these files go inside the app. Each is named by the
     SHA-256 of its source, so the game loads only an exact match, and a rebuild reuses every shader that did not change."""
@@ -581,7 +596,8 @@ def step_shader_libs(tree, logs, *, version='v0'):
     metal, compiler, metal_env = found
     libs = tree/'build/shader-libs'
     stamp = libs/'compiler.txt'
-    identity = ' '.join([compiler, *METAL_FLAGS])
+    flags = [*METAL_FLAGS, f'-mmacosx-version-min={deployment_target}']
+    identity = ' '.join([compiler, *flags])
     if stamp.is_file() and stamp.read_text() != identity:
         shutil.rmtree(libs)
     libs.mkdir(parents=True, exist_ok=True)
@@ -596,12 +612,12 @@ def step_shader_libs(tree, logs, *, version='v0'):
     def compile_one(item):
         digest, src = item
         partial = libs/f'{digest}.partial'
-        r = subprocess.run([metal, *METAL_FLAGS, '-o', partial, src], capture_output=True, text=True, env=metal_env)
+        r = subprocess.run([metal, *flags, '-o', partial, src], capture_output=True, text=True, env=metal_env)
         if r.returncode:
             partial.unlink(missing_ok=True)
             return f'{src.name}\n{r.stdout}{r.stderr}'
         partial.replace(libs/f'{digest}.metallib')
-    with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+    with concurrent.futures.ThreadPoolExecutor(min(os.cpu_count() or 4, 4)) as pool:
         failed = [f for f in pool.map(compile_one, todo.items()) if f]
     log = logs/'shader-libs.log'
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -612,11 +628,14 @@ def step_shader_libs(tree, logs, *, version='v0'):
 
 def step_binary(tree, game, keys, env, logs, *, version="v0"):
     say('4/4 app: building the game binary and the launcher')
-    run(['make', f'-j{os.cpu_count() or 4}', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
+    target = env.get('MACOSX_DEPLOYMENT_TARGET', '26.0')
+    flags = ['-arch', 'arm64', f'-mmacosx-version-min={target}']
+    jobs = min(os.cpu_count() or 4, 4)  # 16 GB Macs: avoid compiling every large graphics unit concurrently.
+    run(['make', f'-j{jobs}', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', *flags, '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
          '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
     # used only while packaging (step_warm_metal); not part of the app
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', 'tools/warm_metal_cache.m', '-framework', 'Metal',
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', *flags, 'tools/warm_metal_cache.m', '-framework', 'Metal',
          '-framework', 'Foundation', '-o', 'build/warm-metal-cache'], logs / 'warm-metal-cache-build.log', cwd=tree, env=env)
     if not (tree / 'build/AppIcon.icns').exists():   # the game's own icon from its control data; optional
         try:
@@ -679,7 +698,7 @@ def step_app(tree, out, logs, *, version="v0"):
     clone(tree / 'build/app-launcher', tmp / 'Contents/MacOS/TOTK')
     info = dict(CFBundleDevelopmentRegion='en', CFBundleExecutable='TOTK', CFBundleIdentifier=BUNDLE_ID, CFBundleName=APP_NAME,
                 CFBundleDisplayName=APP_NAME, CFBundlePackageType='APPL', CFBundleShortVersionString=expected['display_version'],
-                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion='26.0', NSHighResolutionCapable=True,
+                CFBundleVersion=str(expected['version'] + 1), LSMinimumSystemVersion=('15.0' if (tree/'build/metal-backend').is_file() and (tree/'build/metal-backend').read_text().split()[0] == '3' else '26.0'), NSHighResolutionCapable=True,
                 LSApplicationCategoryType='public.app-category.action-games', LSSupportsGameMode=True,
                 GCSupportsControllerUserInteraction=True)
     icon = tree / 'build/AppIcon.icns'
@@ -801,6 +820,7 @@ def parse_args(argv):
     ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0')
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app')
     ap.add_argument('--platform', choices=('macos','ios'), default='macos', help='build a macOS app (default) or unsigned iPhone/iPad IPA')
+    ap.add_argument('--metal-backend', choices=('auto', '3', '4'), default='auto', help='macOS graphics API: auto selects Metal 3 on macOS 15–25, Metal 4 on 26+; 3 also permits testing the fallback on a newer Mac')
     ap.add_argument('-k', '--keys', type=Path, required=True, help='your prod.keys')
     ap.add_argument('-o', '--out', type=Path, help=f'the app or IPA to write (default depends on --platform; next to the game file)')
     ap.add_argument('--work', type=Path, help='work folder (default: TOTK_build next to the game file)')
@@ -866,6 +886,9 @@ def main(argv):
             raise BuildError('needs about 25 GB free for the work folder (the app itself is an APFS clone of it when on the same volume)')
     logs = work / 'logs'
     env = dict(os.environ, PATH=os.pathsep.join(TOOL_PATHS + [os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')]))
+    env['METAL_BACKEND'] = metal_backend(int(platform.mac_ver()[0].split('.')[0]), args.metal_backend)
+    env['MACOSX_DEPLOYMENT_TARGET'] = '15.0' if env['METAL_BACKEND'] == '3' else '26.0'
+    say(f"Metal {env['METAL_BACKEND']} backend, deployment target macOS {env['MACOSX_DEPLOYMENT_TARGET']}")
     t0 = time.time()
     tree = prepare_work(work, py, logs)
     if update:
@@ -876,8 +899,8 @@ def main(argv):
     step_data(tree, game, keys, logs, firmware=firmware, shared_fonts=shared_fonts)
     if update:
         step_update_data(tree, game, update, keys, logs, version=version)
-    step_shaders(tree, logs, version=version)
-    step_shader_libs(tree, logs, version=version)
+    step_shaders(tree, logs, version=version, deployment_target=env['MACOSX_DEPLOYMENT_TARGET'])
+    step_shader_libs(tree, logs, version=version, deployment_target=env['MACOSX_DEPLOYMENT_TARGET'])
     step_binary(tree, game, keys, env, logs, version=version)
     say(f'4/4 app: assembling {out}')
     if args.platform=='ios':

@@ -57,7 +57,7 @@ int mtl_probe_cube_merge(void) {
     tex_t ot; memset(&ot, 0, sizeof ot); ot.serial = 0xffffffd0; ot.d.format = 0x25; ot.d.width = ot.d.height = 16; ot.d.depth = 1; ot.d.levels = 1; ot.d.target = 1; ot.d.samples = 1; serial_put(ot.serial, other);
     mtl_sub_begin(); { op_hdr end = {OP_END, 8}; mtl_exec((const uint8_t *)&end); }   // replay state and an open submission
     for (int c = 0; c < CGP_N; c++) for (int lv = 0; lv < 2; lv++) {   // every face of every level starts transparent black
-        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; rp.colorAttachments[0].texture = cubes[c]; rp.colorAttachments[0].level = (NSUInteger)lv;
+        RPD *rp = [RPD new]; rp.colorAttachments[0].texture = cubes[c]; rp.colorAttachments[0].level = (NSUInteger)lv;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.renderTargetArrayLength = 6; ser_gate(); enc_r_end(enc_r_begin(rp));
     }

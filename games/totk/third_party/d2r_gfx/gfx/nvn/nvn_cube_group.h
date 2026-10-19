@@ -116,27 +116,31 @@ static id<MTLComputePipelineState> cg_pso(int out) {
         if (!ps[out]) { failed = 1; MLOG("【红】[cube-merge] 拷贝计算核建不出：%s（改用 blit 拷贝）", e.localizedDescription.UTF8String); return nil; } }
     return ps[out];
 }
-static id<MTL4ArgumentTable> cg_table(void) {
-    static id<MTL4ArgumentTable> t;
-    if (!t) { MTL4ArgumentTableDescriptor *d = [MTL4ArgumentTableDescriptor new]; d.maxTextureBindCount = 12; d.maxBufferBindCount = 1; NSError *e = nil;
-        t = [g_dev newArgumentTableWithDescriptor:d error:&e]; if (!t) MDIE("cube-merge argument table: %s", e.localizedDescription.UTF8String); }
+static ARG_TABLE cg_table(void) {
+    static ARG_TABLE t;
+    if (!t) { ARG_DESC *d = [ARG_DESC new]; d.maxTextureBindCount = 12; d.maxBufferBindCount = 1; NSError *e = nil;
+        t = arg_table_new(g_dev, d, &e); if (!t) MDIE("cube-merge argument table: %s", e.localizedDescription.UTF8String); }
     return t;
 }
 // 1 = done by the kernel, 0 = the caller blits (no kernel, or a cube the copy-out could not write)
+#if DM_NVN_M3
+static int cg_copy_kernel(int out, const cg_group *g, const cg_temp *tp, __strong id<MTLTexture> *ct) { (void)out; (void)g; (void)tp; (void)ct; return 0; }
+#else
 static int cg_copy_kernel(int out, const cg_group *g, const cg_temp *tp, __strong id<MTLTexture> *ct) {
     id<MTLComputePipelineState> ps = cg_pso(out); if (!ps) return 0;
     if (out) for (int c = 0; c < g->n; c++) if (!(ct[c].usage & MTLTextureUsageShaderWrite)) { g_cg.blit_out++; return 0; }
-    id<MTL4ComputeCommandEncoder> b = blit(); id<MTL4ArgumentTable> at = cg_table();
-    for (int c = 0; c < 6; c++) [at setTexture:ct[c < g->n ? c : 0].gpuResourceID atIndex:(NSUInteger)c];   // unused slots repeat cube 0 (never touched: c < n)
-    for (int f = 0; f < 6; f++) [at setTexture:tp->t[f].gpuResourceID atIndex:(NSUInteger)(6 + f)];
+    BENC b = blit(); ARG_TABLE at = cg_table();
+    for (int c = 0; c < 6; c++) [at setTexture:GPU_RESOURCE(ct[c < g->n ? c : 0]) atIndex:(NSUInteger)c];   // unused slots repeat cube 0 (never touched: c < n)
+    for (int f = 0; f < 6; f++) [at setTexture:GPU_RESOURCE(tp->t[f]) atIndex:(NSUInteger)(6 + f)];
     id<MTLBuffer> pb; size_t off = arena_alloc(64, &pb); uint32_t *p = (uint32_t *)((uint8_t *)pb.contents + off); memset(p, 0, 64);
     p[0] = (uint32_t)g->n; p[1] = (uint32_t)out; for (int c = 0; c < g->n; c++) p[4 + c] = (uint32_t)g->m[c].lv;
     [at setAddress:pb.gpuAddress + off atIndex:0];
-    [b setArgumentTable:at]; [b setComputePipelineState:ps];
+    arg_table_compute(b, at); [b setComputePipelineState:ps];
     [b dispatchThreads:MTLSizeMake(g->w, g->h, 6 * (NSUInteger)g->n) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-    [b setArgumentTable:g_ct]; args_dirty_all();   // the replay's own dispatches re-bind their table and arguments
+    arg_table_compute(b, g_ct); args_dirty_all();   // the replay's own dispatches re-bind their table and arguments
     g_cg.kcopies++; return 1;
 }
+#endif
 static void cg_member_state(const cg_member *m) {   // the member's state, as at its draw
     memcpy(&S, m->S_, sizeof S); R.sc = m->sc; R.has_sc = m->has_sc; args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
 }
@@ -158,7 +162,7 @@ static void cg_flush_group(cg_group *g) {
     MTLSize sz = MTLSizeMake(g->w, g->h, 1); MTLOrigin o0 = MTLOriginMake(0, 0, 0);
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (g_cg_probe_neg != 18 && !cg_copy_kernel(0, g, tp, ct)) {   // copy in: the pass loads exactly what the cube levels hold now
-        id<MTL4ComputeCommandEncoder> b = blit();
+        BENC b = blit();
         for (int c = 0; c < g->n; c++) for (int f = 0; f < 6; f++) { enc_b_copy_texture(b, ct[c], (NSUInteger)f, (NSUInteger)g->m[c].lv, o0, sz, tp->t[f], (NSUInteger)c, 0, o0); g_cg.copies++; }
     }
     uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); g_cg.ns_in += t1 - t0;
@@ -173,7 +177,7 @@ static void cg_flush_group(cg_group *g) {
     g_cg_force_layers = 0; rp_end();
     uint64_t t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); g_cg.ns_draw += t2 - t1;
     if (!cg_copy_kernel(1, g, tp, ct)) {   // copy out
-        id<MTL4ComputeCommandEncoder> b = blit();
+        BENC b = blit();
         for (int c = 0; c < g->n; c++) for (int f = 0; f < 6; f++) { enc_b_copy_texture(b, tp->t[f], (NSUInteger)c, 0, o0, sz, ct[c], (NSUInteger)f, (NSUInteger)g->m[c].lv, o0); g_cg.copies++; }
     }
     g_cg.ns_out += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t2;

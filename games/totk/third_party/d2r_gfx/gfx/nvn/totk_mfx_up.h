@@ -1,6 +1,7 @@
 // TOTK: MetalFX spatial upscaling (TOTK_MFX_UPSCALE; not in D2R). See totk_mfx_up.m.
 #pragma once
 #import <Metal/Metal.h>
+#include "nvn_backend.h"
 
 /* One scaler context per use; each context is used from one thread only. */
 enum {
@@ -21,12 +22,12 @@ void mfxup_set(int on);    // runtime: "flag mfx_upscale 0|1"
    and usage must suit MetalFX; out_w / out_h are dst's size). mode: an MTLFXSpatialScalerColorProcessingMode. Returns the
    texture written, or nil when this configuration cannot be built or is still being built in the background (the caller
    keeps its own path for this frame). */
-id<MTLTexture> mfxup_encode_ex(int ctx, id<MTL4CommandBuffer> cb, id<MTLTexture> src, NSUInteger in_w, NSUInteger in_h,
+id<MTLTexture> mfxup_encode_ex(int ctx, CBUF cb, id<MTLTexture> src, NSUInteger in_w, NSUInteger in_h,
                                id<MTLTexture> dst, NSUInteger out_w, NSUInteger out_h, int mode);
 /* Whether the scaler for this configuration is ready (1); otherwise it is being built on a background queue (about 70 ms) and
    the caller keeps its own path for now. A caller that must end its encoders before encoding asks first. */
 int mfxup_prepare(int ctx, id<MTLTexture> src, id<MTLTexture> dst, NSUInteger out_w, NSUInteger out_h, int mode);
 // The iOS hook's form: all of src into the scene context's own texture, HDR colour processing (the scene before tone mapping).
-id<MTLTexture> mfxup_encode(id<MTL4CommandBuffer> cb, id<MTLTexture> src, NSUInteger out_w, NSUInteger out_h);
+id<MTLTexture> mfxup_encode(CBUF cb, id<MTLTexture> src, NSUInteger out_w, NSUInteger out_h);
 id<MTLResidencySet> mfxup_residency(void);   // the contexts' own output textures (nil until one exists); the queue adds it once
 void mfxup_stats(int ctx, char *out, size_t n);

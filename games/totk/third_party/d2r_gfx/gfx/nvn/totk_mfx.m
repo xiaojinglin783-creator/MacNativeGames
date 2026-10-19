@@ -1,3 +1,28 @@
+#import <Metal/Metal.h>
+#include "nvn_backend.h"
+#if DM_NVN_M3
+#include "totk_mfx.h"
+#include <stdio.h>
+const char *mfx_mode_name(int mode) { (void)mode; return "off (Metal 3)"; }
+int mfx_enabled(void) { return 0; }
+void mfx_set(int mode) { (void)mode; fprintf(stderr, "[mfx] interpolation requires Metal 4; using game frames on Metal 3\n"); }
+int mfx_latch(void) { return 0; }
+id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat f) { (void)dev; (void)w; (void)h; (void)f; return nil; }
+id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) { (void)dev; (void)w; (void)h; return nil; }
+void mfx_note_scene(void) {}
+void mfx_note_depth(id<MTLTexture> depth) { (void)depth; }
+void mfx_note_camera(const float *cam, int n) { (void)cam; (void)n; }
+id<MTLResidencySet> mfx_residency(void) { return nil; }
+int mfx_frame_prepare(double frame_s) { (void)frame_s; return -1; }
+NSArray *mfx_frame_encode(CBUF cb, int slot, MFX_HEAP heap, NSUInteger stamp) { (void)cb; (void)slot; (void)heap; (void)stamp; return nil; }
+void mfx_note_gpu(double ms) { (void)ms; }
+void mfx_frame_abort(void) {}
+id<MTLTexture> mfx_output(int slot) { (void)slot; return nil; }
+void mfx_stats(char *out, size_t n) { snprintf(out, n, "off (Metal 3)"); }
+void mfx_mv_log(void) {}
+int mfx_dump_due(void) { return 0; }
+void mfx_dump(long frame, id<MTLTexture> prev, id<MTLTexture> cur) { (void)frame; (void)prev; (void)cur; }
+#else
 // TOTK: MetalFX frame interpolation (TOTK_MFX=interp30 / interp / interpmax, or key 2 / flag mfx_interp at run time; not in
 // D2R). MetalFX makes one more frame between two game frames. Modes (totk_mfx.h): the game at 30 fps ("30+30"), at every
 // second display refresh ("50+50" on the user's 100 Hz display: every refresh a new picture, steadier than the uncapped
@@ -384,3 +409,5 @@ void mfx_stats(char *out, size_t n) {
              (unsigned long long)g.miss[2], (unsigned long long)g.miss[3],
              (unsigned long long)g.skip_first, (unsigned long long)g.skip_cut, (unsigned long long)g.skip_busy);
 }
+
+#endif
