@@ -255,3 +255,25 @@ TOTK_ARG_EPOCH=1 TOTK_M3_RESOURCE_CACHE=1 \
 No performance claim is made before the user's GPU/gameplay measurements.
 Linux branch audits and the 101-test Python suite pass (11 skips); native
 compilation and GPU readback remain to be run on macOS.
+
+### Sampling-guided GPU address lookup
+
+A 20-second user `sample` captured 435 leaf samples in `m3_buf`, including
+212 beneath indexed drawing alone. This identifies a sustained CPU hotspot;
+it does not identify the cause of every 100–300 ms gameplay stall. GUI-thread
+and idle worker waits in the same sample are not evidence of deadlock.
+
+The Metal 3 buffer registry is now sorted by GPU base. The last-hit fast path
+remains, and a miss uses binary search before the prior range-scan fallback.
+The fallback preserves overlapping interval support; range checks still use
+subtraction to avoid end-address overflow. Registration/deletion preserve order,
+all access retains the same lock, and buffer ownership is unchanged. Metal 4
+does not compile this registry. No additional gameplay switch is required.
+
+`nvn_gpu_lookup.h` provides the upper-bound search. A portable compiled C test
+checks 20,000 insertion/deletion sequences against a linear reference, including
+empty tables, duplicate bases, boundaries, and UINT64_MAX. The existing native
+argument probe now also checks real Metal buffer offsets, removal, re-insertion,
+and last-hit validity after sorted entries shift. Repeat that probe on the Mac
+after rebuilding. Both API branch audits and the 102-test Python suite passed
+(11 platform/tool-dependent skips); native validation/performance remain pending.

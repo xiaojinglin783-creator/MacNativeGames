@@ -234,18 +234,48 @@ static _Atomic int g_up_pending;
 static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // 驻留集专用锁：res_add 会在持 g_mu 的路径里调用（arena_new），不能共用 g_mu | Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
 static NSHashTable *g_res_objects;
 #if DM_NVN_M3
-// 老接口按「缓冲对象 + 偏移」绑定，而回放层手里是显卡地址：登记过的缓冲（内存池的零拷贝缓冲、参数区块、暂存块等，几十个）按地址区间反查。
-// 弱引用登记（__unsafe_unretained + 撤驻留时摘掉）；最近命中的那一项先试——同一通道里的绑定几乎都落在同一两个缓冲上
-// The older API binds by "buffer object + offset", while the replay layer holds GPU addresses: registered buffers (zero-copy buffers of memory pools, argument blocks, staging blocks and so on, a few dozen) are looked up by address range.
-// Registered by weak reference (__unsafe_unretained, removed when residency is withdrawn); the most recently hit entry is tried first - bindings within one pass almost always land on the same one or two buffers
+#include "nvn_gpu_lookup.h"
+// Address-sorted registry: keep the hot last-hit check, then binary search.
+// All queries and mutations stay under the existing lock. Overlapping ranges
+// retain a linear fallback when the nearest preceding base does not contain GPU.
 static int g_m3_cap;
-static struct { uint64_t gpu, len; __unsafe_unretained id<MTLBuffer> buf; } *g_m3_bufs; static int g_m3_nbufs; static os_unfair_lock g_m3_lk = OS_UNFAIR_LOCK_INIT;
-static void m3_buf_add(id<MTLBuffer> b) { os_unfair_lock_lock(&g_m3_lk); for (int i = 0; i < g_m3_nbufs; i++) if (g_m3_bufs[i].buf == b) { os_unfair_lock_unlock(&g_m3_lk); return; } if (g_m3_nbufs == g_m3_cap) { g_m3_cap = g_m3_cap ? g_m3_cap * 2 : 512; void *mem = realloc(g_m3_bufs, (size_t)g_m3_cap * sizeof *g_m3_bufs); if (!mem) MDIE("Metal 3 buffer registry allocation failed"); g_m3_bufs = mem; } { g_m3_bufs[g_m3_nbufs].gpu = b.gpuAddress; g_m3_bufs[g_m3_nbufs].len = b.length; g_m3_bufs[g_m3_nbufs++].buf = b; } os_unfair_lock_unlock(&g_m3_lk); }
-static void m3_buf_del(id b) { os_unfair_lock_lock(&g_m3_lk); for (int i = 0; i < g_m3_nbufs; i++) if (g_m3_bufs[i].buf == b) { g_m3_bufs[i] = g_m3_bufs[--g_m3_nbufs]; break; } os_unfair_lock_unlock(&g_m3_lk); }
+static struct { uint64_t gpu, len; __unsafe_unretained id<MTLBuffer> buf; } *g_m3_bufs;
+static int g_m3_nbufs;
+static os_unfair_lock g_m3_lk = OS_UNFAIR_LOCK_INIT;
+static void m3_buf_add(id<MTLBuffer> b) {
+    os_unfair_lock_lock(&g_m3_lk);
+    for (int i = 0; i < g_m3_nbufs; i++) if (g_m3_bufs[i].buf == b) { os_unfair_lock_unlock(&g_m3_lk); return; }
+    if (g_m3_nbufs == g_m3_cap) {
+        g_m3_cap = g_m3_cap ? g_m3_cap * 2 : 512;
+        void *mem = realloc(g_m3_bufs, (size_t)g_m3_cap * sizeof *g_m3_bufs);
+        if (!mem) MDIE("Metal 3 buffer registry allocation failed");
+        g_m3_bufs = mem;
+    }
+    uint64_t gpu = b.gpuAddress;
+    size_t at = nvn_gpu_upper_bound(g_m3_bufs, g_m3_nbufs, sizeof *g_m3_bufs, gpu);
+    memmove(g_m3_bufs + at + 1, g_m3_bufs + at, (g_m3_nbufs - at) * sizeof *g_m3_bufs);
+    g_m3_bufs[at].gpu = gpu; g_m3_bufs[at].len = b.length; g_m3_bufs[at].buf = b;
+    g_m3_nbufs++;
+    os_unfair_lock_unlock(&g_m3_lk);
+}
+static void m3_buf_del(id b) {
+    os_unfair_lock_lock(&g_m3_lk);
+    for (int i = 0; i < g_m3_nbufs; i++) if (g_m3_bufs[i].buf == b) {
+        --g_m3_nbufs;
+        memmove(g_m3_bufs + i, g_m3_bufs + i + 1, (g_m3_nbufs - i) * sizeof *g_m3_bufs);
+        break;
+    }
+    os_unfair_lock_unlock(&g_m3_lk);
+}
 static id<MTLBuffer> m3_buf(uint64_t gpu, NSUInteger *off) {
     static _Thread_local int last; id<MTLBuffer> r = nil; *off = 0; if (!gpu) return nil;
     os_unfair_lock_lock(&g_m3_lk);
     int i = last < g_m3_nbufs && gpu >= g_m3_bufs[last].gpu && gpu - g_m3_bufs[last].gpu < g_m3_bufs[last].len ? last : -1;
+    if (i < 0) {
+        size_t end = nvn_gpu_upper_bound(g_m3_bufs, g_m3_nbufs, sizeof *g_m3_bufs, gpu);
+        if (end && gpu - g_m3_bufs[end-1].gpu < g_m3_bufs[end-1].len) i = (int)end-1;
+    }
+    // Preserve support for overlapping/aliased intervals and unknown addresses.
     for (int k = 0; i < 0 && k < g_m3_nbufs; k++) if (gpu >= g_m3_bufs[k].gpu && gpu - g_m3_bufs[k].gpu < g_m3_bufs[k].len) i = k;
     if (i >= 0) { last = i; r = g_m3_bufs[i].buf; *off = (NSUInteger)(gpu - g_m3_bufs[i].gpu); }
     os_unfair_lock_unlock(&g_m3_lk);
@@ -13773,6 +13803,31 @@ int mtl_probe_vertex_streams(void) {
    must also invalidate. Negative 18 ignores binding generations, 19 snapshots. */
 int mtl_probe_arg_epoch(void) {
     mtl_init(); int checked = 0;
+#if DM_NVN_M3
+    // Real Metal buffers exercise sorted insertion, offset lookup, deletion,
+    // re-insertion and a stale last-hit index after the registry shifts.
+    id<MTLBuffer> buffers[32];
+    for (int i = 0; i < 32; i++) buffers[i] = probe_buf(256);
+    for (int phase = 0; phase < 3; phase++) {
+        for (int i = 31; i >= 0; i--) {
+            NSUInteger offset = 0;
+            if (m3_buf(buffers[i].gpuAddress + 127, &offset) != buffers[i] || offset != 127)
+                MDIE("Metal 3 sorted buffer lookup mismatch");
+            checked++;
+        }
+        if (phase == 0) for (int i = 0; i < 32; i += 2) m3_buf_del(buffers[i]);
+        if (phase == 0) {
+            for (int i = 0; i < 32; i += 2) {
+                NSUInteger offset = 0;
+                if (m3_buf(buffers[i].gpuAddress, &offset) == buffers[i])
+                    MDIE("Metal 3 sorted lookup returned a removed buffer");
+                checked++;
+            }
+            for (int i = 30; i >= 0; i -= 2) m3_buf_add(buffers[i]);
+        }
+    }
+    for (int i = 0; i < 32; i++) res_remove(buffers[i]);
+#endif
     const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int negative = ne ? atoi(ne) : 0;
     const size_t size = 16384; void *mem = NULL;
     if (posix_memalign(&mem, size, size) || !mem) MDIE("argument epoch probe memory");
