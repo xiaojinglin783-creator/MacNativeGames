@@ -1124,6 +1124,29 @@ static void pt_note_key(const char *key) { (void)key; }
 static void pt_finish(id cb, TotkCommitOptions *o, uint64_t f) { (void)cb; (void)o; (void)f; }
 static int arg_bind_cache_on(void) { return 0; }
 static uint64_t g_m3_render_epoch;
+// Bounded, encoder-local cache. Strong slots prevent pointer reuse; clear at
+// encoder end so this optimization cannot retain textures across frames.
+static id<MTLResource> g_m3_used[256];
+static MTLResourceUsage g_m3_usage[256];
+static uint64_t g_m3_use_epoch[256], g_m3_use_calls, g_m3_use_skips;
+static int m3_resource_cache_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_M3_RESOURCE_CACHE"); on = e && atoi(e); }
+    return on;
+}
+static void m3_use_resource(RENC encoder, id<MTLResource> resource, MTLResourceUsage usage) {
+    if (m3_resource_cache_on()) {
+        size_t slot = ((uintptr_t)(__bridge void *)resource >> 4) & 255;
+        if (g_m3_use_epoch[slot] == g_m3_render_epoch && g_m3_used[slot] == resource) {
+            if ((g_m3_usage[slot] & usage) == usage) { g_m3_use_skips++; return; }
+            usage |= g_m3_usage[slot]; // read -> read/write must still be declared
+        }
+        g_m3_used[slot] = resource; g_m3_usage[slot] = usage;
+        g_m3_use_epoch[slot] = g_m3_render_epoch;
+    }
+    [encoder useResource:resource usage:usage stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    g_m3_use_calls++;
+}
 static void es_reset(void) {}
 static inline void blit_close(void) { if (g_blit) { m4_end(g_blit); g_blit = nil; } }
 static void enc_r_clip(RENC e, MTLDepthClipMode m) { [e setDepthClipMode:m]; }
@@ -1134,7 +1157,10 @@ static inline void m3_rbuf(id<MTLRenderCommandEncoder> e, int vertex, NSUInteger
     if (vertex) [e setVertexBuffer:b offset:off atIndex:i]; else [e setFragmentBuffer:b offset:off atIndex:i];
 }
 static inline RENC enc_r_begin(RPD *d) { blit_close(); if (++g_m3_render_epoch == 0) MDIE("Metal 3 render encoder generation overflow"); return [g_cb renderCommandEncoderWithDescriptor:d]; }
-static inline void enc_r_end(id e) { m4_end(e); }
+static inline void enc_r_end(id e) {
+    m4_end(e);
+    if (m3_resource_cache_on()) for (size_t i = 0; i < 256; i++) g_m3_used[i] = nil;
+}
 static inline void enc_r_pso(RENC e, id<MTLRenderPipelineState> p) { [e setRenderPipelineState:p]; }
 static inline void enc_r_dss(RENC e, id<MTLDepthStencilState> s) { [e setDepthStencilState:s]; }
 static inline void enc_r_viewport(RENC e, MTLViewport v) { [e setViewport:v]; }
@@ -3658,6 +3684,9 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     MLOG("[arg-epoch] enabled=%d hits=%llu extra=%llu verified=%llu", arg_epoch_on(), (unsigned long long)g_arg_epoch_hits, (unsigned long long)g_arg_epoch_extra, (unsigned long long)g_arg_epoch_verified);
     MLOG("[tex-slots] enabled=%d hits=%llu misses=%llu verified=%llu", tex_slots_on(), (unsigned long long)g_tex_slots_hits, (unsigned long long)g_tex_slots_misses, (unsigned long long)g_tex_slots_verified);
     MLOG("[arg-bind-cache] enabled=%d sets=%llu skips=%llu",arg_bind_cache_on(),(unsigned long long)g_arg_bind_sets,(unsigned long long)g_arg_bind_skips);
+#if DM_NVN_M3
+    MLOG("[m3-resource-cache] enabled=%d declarations=%llu skipped=%llu", m3_resource_cache_on(), (unsigned long long)g_m3_use_calls, (unsigned long long)g_m3_use_skips);
+#endif
     { uint64_t hits, misses, checked;
       pthread_mutex_lock(&g_mu); hits=g_pool_queries.hits; misses=g_pool_queries.misses; checked=g_pool_query_checked; pthread_mutex_unlock(&g_mu);
       MLOG("[pool-query-cache] enabled=%d hits=%llu misses=%llu checked=%llu",pool_query_on(),(unsigned long long)hits,(unsigned long long)misses,(unsigned long long)checked); }
@@ -6999,7 +7028,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     // 不声明的话只读贴图会和写它的拷贝乱序（迁 Metal 4 前实测过）。同一编码器内重复声明是幂等的
     // Older API: every resource a shader accesses indirectly through an argument block must have its usage declared on this encoder, so that the system knows its ordering dependency against other encoders (upload copies, other passes);
     // without the declaration a read-only texture gets out of order with the copy that writes it (measured before the move to Metal 4). Repeated declarations within one encoder are idempotent
-    #define USE(r, u) do { id<MTLResource> r_ = (id<MTLResource>)(r); if (r_) { if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:r_ usage:(u)]; else [(id<MTLRenderCommandEncoder>)en useResource:r_ usage:(u) stages:MTLRenderStageVertex | MTLRenderStageFragment]; } \
+    #define USE(r, u) do { id<MTLResource> r_ = (id<MTLResource>)(r); if (r_) { if (nvn_stage == 5) [(id<MTLComputeCommandEncoder>)en useResource:r_ usage:(u)]; else m3_use_resource((id<MTLRenderCommandEncoder>)en, r_, (u)); } \
         if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)
     #define USE_SAMP(r, u) do { (void)(u); if (__builtin_expect(g_res_check_on, 0)) res_check((r), sh->key, reg); } while (0)   // 采样器不是资源，不用声明 | samplers are not resources and need no declaration
 #else
@@ -13800,6 +13829,17 @@ int mtl_probe_arg_epoch(void) {
                         enc_r_end(en); rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
                         en = enc_r_begin(rp); enc_r_cull(en,MTLCullModeNone);
                         enc_r_viewport(en,(MTLViewport){0,0,32,8,0,1});
+                    }
+#endif
+#if DM_NVN_M3
+                    if (m3_resource_cache_on() && (stripe == 0 || stripe == 12)) {
+                        uint64_t calls = g_m3_use_calls, skips = g_m3_use_skips;
+                        m3_use_resource(en, rb, MTLResourceUsageRead);
+                        m3_use_resource(en, rb, MTLResourceUsageRead);
+                        m3_use_resource(en, rb, MTLResourceUsageRead | MTLResourceUsageWrite);
+                        m3_use_resource(en, rb, MTLResourceUsageRead);
+                        if (g_m3_use_calls != calls+2 || g_m3_use_skips != skips+2)
+                            MDIE("Metal 3 resource cache declaration/invalidation mismatch");
                     }
 #endif
                     uint64_t encodes = g_stat_args_enc, extra = g_arg_epoch_extra, hits = g_arg_epoch_hits;

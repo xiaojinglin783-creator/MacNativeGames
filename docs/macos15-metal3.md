@@ -223,3 +223,35 @@ a speedup is not guaranteed. Linux validation: both API branch audits passed;
 101 Python tests ran successfully (11 platform/tool-dependent skips). Native
 compilation, GPU readback, and gameplay measurements for this change still need
 the user's Mac. No game data, keys, fonts, or saves are modified by this change.
+
+### Optional encoder-local Metal 3 resource declarations
+
+`TOTK_M3_RESOURCE_CACHE=1` skips duplicate `useResource` declarations for the
+same resource and usage within one render encoder. A bounded 256-slot cache
+retains its entries only until encoder end. Collisions cause extra declarations,
+never skipped declarations. Usage upgrades emit the union of prior/new usage;
+compute encoders are unchanged. Default off; Metal 4 is unchanged. Diagnostics
+report `[m3-resource-cache]` declaration and skip totals.
+
+The argument epoch GPU probe additionally checks duplicate suppression, a
+read-to-read/write upgrade, and redeclaration after replacing the encoder.
+For the user's **1.4.3** build, the correct command (rather than the v0 example
+above) is:
+
+```sh
+cd "$HOME/TOTK_build_metal3/totk"
+MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=assert TOTK_HEADLESS=1 \
+  TOTK_M3_RESOURCE_CACHE=1 \
+  ./build/totk-native-v143 rewritten/v143 probe-gpu-arg-epoch
+```
+
+After a successful native probe, compare the same gameplay scene using:
+
+```sh
+TOTK_ARG_EPOCH=1 TOTK_M3_RESOURCE_CACHE=1 \
+  "$HOME/TOTK Metal3.app/Contents/MacOS/TOTK"
+```
+
+No performance claim is made before the user's GPU/gameplay measurements.
+Linux branch audits and the 101-test Python suite pass (11 skips); native
+compilation and GPU readback remain to be run on macOS.
