@@ -297,6 +297,15 @@ def fonts_valid(folder):
         return False
 
 
+# Additional base-game metadata variant verified against the retail ACID public
+# key. The original reference hashes remain unchanged; no program hash is relaxed.
+VERIFIED_BASE_NPDM = '890c6174a31605519d82361fd5e2e941d684601f6aec317caa67b7e1a60b0c5a'
+
+
+def exefs_hash_matches(version, name, actual, expected):
+    return actual == expected or (version == 'v0' and name == 'main.npdm' and actual == VERIFIED_BASE_NPDM)
+
+
 def step_code(tree, game, keys, env, logs, *, version="v0"):
     expected = VERSIONS[version]
     update_args = [] if version == "v0" else ["--update"]
@@ -304,7 +313,7 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
     exefs = tree / f'extracted/{version}/exefs'
     want = expected['exefs_sha256']
     manifest = exefs.parent / 'extraction-manifest.json'
-    if not source_matches(manifest, game) or not all((exefs / n).is_file() and sha256(exefs / n) == h for n, h in want.items()):
+    if not source_matches(manifest, game) or not all((exefs / n).is_file() and exefs_hash_matches(version, n, sha256(exefs / n), h) for n, h in want.items()):
         say('1/4 code: extracting the ExeFS from the game file')
         if exefs.exists():
             shutil.rmtree(exefs)
@@ -313,7 +322,12 @@ def step_code(tree, game, keys, env, logs, *, version="v0"):
     for n, h in want.items():
         if not (exefs / n).is_file():
             raise BuildError(f'ExeFS {n} is missing; not the supported version')
-        check(f'ExeFS {n}', sha256(exefs / n), h)
+        actual = sha256(exefs / n)
+        if not exefs_hash_matches(version, n, actual, h):
+            check(f'ExeFS {n}', actual, h)
+        elif actual != h:
+            run([py, 'scripts/verify_npdm_signature.py', exefs / n], logs / 'verify-npdm-v0.log', cwd=tree)
+            say('1/4 code: additional 1.0.0 NPDM variant verified (retail signature and exact SHA-256)')
     if not (tree / f'extracted/{version}/elf/main-inventory.json').exists():
         run([py, 'scripts/prepare_modules.py', exefs, '--output', tree / f'extracted/{version}/elf'], logs / 'prepare_modules.log', cwd=tree)
     out = tree / f'rewritten/{version}'

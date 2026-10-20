@@ -138,3 +138,22 @@ reduction property. MIN/MAX reduction requests stop with an explicit error;
 correct shader emulation for those requests is still outstanding if the game
 uses them. No averaging approximation is silently substituted. Metal 4 retains
 its native reduction modes. A fresh Mac compile/GPU result is still required.
+
+## Verified base-game NPDM variant
+
+A second supplied base-game metadata file has SHA-256
+`890c6174a31605519d82361fd5e2e941d684601f6aec317caa67b7e1a60b0c5a`.
+Its RSA-2048/PSS-SHA256 ACID signature verifies with retail key 0 from the pinned
+hactool `pki.c` public verification moduli. Its META/ACI0 sections and permission
+payload match the earlier supplied file; the 509 byte differences are confined
+to the 512 byte signature/public-modulus area. The earlier supplied file
+(`e78c4097...`) did not verify with the four retail/development public roots tested.
+Neither comparison supplies the bytes of the repository's original `f5a5eecc...`
+reference; that reference remains unchanged and supported.
+
+The additional exact digest is supported only as `main.npdm` for base version
+`v0`. When selected, `verify_npdm_signature.py` also checks title ID, section
+bounds and the retail signature during every build, including cached extraction.
+Other metadata digests remain rejected; program-module and game-data hash checks
+are unchanged. No supplied game metadata or console/decryption key is committed.
+The verifier's public modulus is a verification key, not a game-decryption key.
