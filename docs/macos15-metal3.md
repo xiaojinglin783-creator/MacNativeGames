@@ -189,3 +189,37 @@ exact digest and size. The generated manifest and runtime header record the
 actual selected file's digest/size, so the existing runtime checksum protection
 continues to apply. No font payload is included in the repository. This confirms
 font input integrity; gameplay and glyph appearance still need target validation.
+
+### Optional Metal 3 argument reuse experiment
+
+`TOTK_ARG_EPOCH=1` now permits reuse of read-only shader argument blocks on
+Metal 3 when all existing binding/resource/snapshot generations still match.
+The block must also have been built on the exact same render encoder. Encoder
+creation advances a monotonic generation, so a replacement encoder cannot skip
+its indirect-resource `useResource` declarations, even within one logical pass.
+Writable/image/indirect-pointer bindings and compute dispatches still rebuild.
+Default behavior remains unchanged; Metal 4 retains its existing reuse policy.
+`DM_NVN_AB_NOREUSE=1` also disables this experiment.
+
+The production `probe-gpu-arg-epoch` readback test now replaces an encoder without
+changing the logical pass or bindings, requires a rebuild, and checks the pixels.
+After rebuilding, quit the game and run on the Mac:
+
+```sh
+cd "$HOME/TOTK_build_metal3/totk"
+MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=assert TOTK_HEADLESS=1 \
+  build/totk-native rewritten/v0 probe-gpu-arg-epoch
+```
+
+Only after the GPU probe passes, compare the same stationary gameplay scene:
+
+```sh
+TOTK_ARG_EPOCH=1 "$HOME/TOTK Metal3.app/Contents/MacOS/TOTK"
+```
+
+Normal Finder launch restores the default (experiment off). Check argument reuse
+counts and frame-time percentiles, and inspect the image for rendering errors;
+a speedup is not guaranteed. Linux validation: both API branch audits passed;
+101 Python tests ran successfully (11 platform/tool-dependent skips). Native
+compilation, GPU readback, and gameplay measurements for this change still need
+the user's Mac. No game data, keys, fonts, or saves are modified by this change.

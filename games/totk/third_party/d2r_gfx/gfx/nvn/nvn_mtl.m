@@ -1123,6 +1123,7 @@ static void pt_mark(id cb, char kind, RPD *d) { (void)cb; (void)kind; (void)d; }
 static void pt_note_key(const char *key) { (void)key; }
 static void pt_finish(id cb, TotkCommitOptions *o, uint64_t f) { (void)cb; (void)o; (void)f; }
 static int arg_bind_cache_on(void) { return 0; }
+static uint64_t g_m3_render_epoch;
 static void es_reset(void) {}
 static inline void blit_close(void) { if (g_blit) { m4_end(g_blit); g_blit = nil; } }
 static void enc_r_clip(RENC e, MTLDepthClipMode m) { [e setDepthClipMode:m]; }
@@ -1132,7 +1133,7 @@ static inline void m3_rbuf(id<MTLRenderCommandEncoder> e, int vertex, NSUInteger
     NSUInteger off; id<MTLBuffer> b = m3_buf(gpu, &off); if (gpu && !b) { { static int n_; if (!n_++) MLOG("【红】" "老接口绑定：显卡地址 %#llx 不在任何登记过的缓冲里（槽 %lu）", (unsigned long long)gpu, (unsigned long)i); } return; }
     if (vertex) [e setVertexBuffer:b offset:off atIndex:i]; else [e setFragmentBuffer:b offset:off atIndex:i];
 }
-static inline RENC enc_r_begin(RPD *d) { blit_close(); return [g_cb renderCommandEncoderWithDescriptor:d]; }
+static inline RENC enc_r_begin(RPD *d) { blit_close(); if (++g_m3_render_epoch == 0) MDIE("Metal 3 render encoder generation overflow"); return [g_cb renderCommandEncoderWithDescriptor:d]; }
 static inline void enc_r_end(id e) { m4_end(e); }
 static inline void enc_r_pso(RENC e, id<MTLRenderPipelineState> p) { [e setRenderPipelineState:p]; }
 static inline void enc_r_dss(RENC e, id<MTLDepthStencilState> s) { [e setDepthStencilState:s]; }
@@ -4705,6 +4706,9 @@ static void shmap_load(void) {
     // The argument buffer encoded last time
     arg_epoch_key ab_epoch; int ab_epoch_ok;
     tex_slot_cache tex_slots;
+#if DM_NVN_M3
+    uint64_t ab_encoder_epoch; // useResource declarations belong to exactly one encoder
+#endif
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass;   // ab_pass：编这块参数的渲染通道序号——只在同一通道内复用（跨通道 / 跨提交的块所在 arena 可能已回收重写） | ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten)
     id<MTLLibrary> bflib; int bflib_tried; NSMutableDictionary<NSString *, id<MTLFunction>> *bffn; id<MTLFunction> no_depth_fn;
     NSString *src, *src_path; NSDictionary<NSNumber *, NSString *> *io; NSMutableDictionary<NSString *, id<MTLFunction>> *vpatch; id<MTLFunction> mfx_fn[8]; uint8_t mfx_tried[8]; } @end   // TOTK: MSL source, user varyings (locn -> type), patched vertex functions   // bflib：可读 tile 版本 <键>_bf（合并 B 第 2 步） | bflib: readable-tile version <key>_bf (merge B step 2)
@@ -6971,7 +6975,15 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         epoch_hit = sh->ab_buf && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
         registry_unlock();
     }
-    int reuse = !DM_NVN_M3 && !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
+    // Metal 3 reuse is opt-in through TOTK_ARG_EPOCH. Its indirect resources
+    // were declared by the full builder on this exact encoder. A new encoder
+    // must rebuild even when the logical pass and all binding epochs match.
+#if DM_NVN_M3
+    int backend_reuse = epoch_mode && sh->ab_encoder_epoch == g_m3_render_epoch;
+#else
+    int backend_reuse = 1;
+#endif
+    int reuse = backend_reuse && !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
@@ -7220,6 +7232,9 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     memcpy((uint8_t *)ab.contents + off, slots, arg_len);
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
     sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_epoch = epoch; g_args_dirty[nvn_stage] = 0;
+#if DM_NVN_M3
+    sh->ab_encoder_epoch = g_m3_render_epoch;
+#endif
     g_stat_args_enc++;
     return 1;
 }
@@ -13778,12 +13793,24 @@ int mtl_probe_arg_epoch(void) {
                     if (stripe == 8) ser_bump(0);
                     if (stripe == 9 || stripe == 10) { storage.addr = stripe == 9 ? 0x5678 : 0x1234; state_op(OP_BIND_SSBO, &storage); }
                     if (stripe == 11) state_op(OP_BIND_SSBO, &storage); // identical binding must keep the epoch
+#if DM_NVN_M3
+                    // Keep the logical pass/bindings unchanged, but replace the
+                    // encoder. Reuse here would skip new resource declarations.
+                    if (stripe == 12) {
+                        enc_r_end(en); rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                        en = enc_r_begin(rp); enc_r_cull(en,MTLCullModeNone);
+                        enc_r_viewport(en,(MTLViewport){0,0,32,8,0,1});
+                    }
+#endif
                     uint64_t encodes = g_stat_args_enc, extra = g_arg_epoch_extra, hits = g_arg_epoch_hits;
                     enc_r_pso(en, pipelines[shader]); enc_r_scissor(en,(MTLScissorRect){stripe*2,0,2,8});
                     encode_args((id<MTLCommandEncoder>)en, shaders[shader], 1, 0); enc_r_draw(en,MTLPrimitiveTypeTriangle,0,3);
                     if (!negative && mode && (stripe == 2 || stripe == 5) && g_arg_epoch_extra != extra+1) MDIE("argument epoch probe did not reuse across programs");
                     if (!negative && mode && stripe >= 3 && stripe <= 10 && stripe != 5 && g_stat_args_enc != encodes+1) MDIE("argument epoch probe failed to rebuild stripe %d", stripe);
                     if (!negative && mode && stripe == 11 && g_arg_epoch_hits != hits+1) MDIE("argument epoch probe rebuilt identical binding");
+#if DM_NVN_M3
+                    if (!negative && mode && stripe == 12 && g_stat_args_enc != encodes+1) MDIE("Metal 3 reused arguments across encoders");
+#endif
                     checked++;
                 }
                 enc_r_end(en);
