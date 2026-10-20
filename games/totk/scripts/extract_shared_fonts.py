@@ -14,6 +14,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import modes
 from extract_exefs import decrypt, read_at, require, load_keys, hfs, nca_ctr_key
 from extract_romfs import index_romfs
+from verify_nca_signature import verify_nca_header_signature
 
 FIRMWARE = Path.home() / 'Library/Application Support/Ryujinx/bis/system/Contents/registered'
 # nn::pl::SharedFontType -> (system data title, BFTTF file name)
@@ -75,12 +76,14 @@ def xci_data_ncas(xci, keys):
     return found
 
 
-def nca_romfs(source, keys, image_path, tickets=None):
+def nca_romfs(source, keys, image_path, tickets=None, *, verify_signatures=False):
     """Write the verified RomFS image of a data NCA (a Path, or a Slice of a game card image) to image_path."""
     with (source if isinstance(source, Slice) else Slice(source)) as f:
         raw = read_at(f, 0, 0xc00)
         hdr = b''.join(decrypt(keys['header_key'], modes.XTS(i.to_bytes(16, 'big')), raw[i * 512:(i + 1) * 512]) for i in range(6))
         require(hdr[0x200:0x204] == b'NCA3', f'Unsupported NCA at {f.base:#x}')
+        if verify_signatures:
+            verify_nca_header_signature(hdr)
         ctr_key = nca_ctr_key(hdr, keys, tickets or {})
         for i in range(4):
             start, end = struct.unpack_from('<II', hdr, 0x240 + i * 16)
@@ -153,6 +156,7 @@ def firmware_data_ncas(folder, keys):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--keys', type=Path, required=True)
+    parser.add_argument('--verify-retail-signatures', action='store_true', help='also require retail RSA signatures for all source font NCAs')
     sources = parser.add_mutually_exclusive_group()
     sources.add_argument('--xci', type=Path, help='game card image: take the fonts from its system update partition')
     sources.add_argument('--firmware', type=Path, help='unpacked firmware NCA directory (for NSP builds)')
@@ -179,7 +183,7 @@ def main():
     for kind, name, title, filename in FONTS:
         if title not in images:
             image_path = args.output / f'{title}.romfs'
-            nca_romfs(source(title), keys, image_path)
+            nca_romfs(source(title), keys, image_path, verify_signatures=args.verify_retail_signatures)
             images[title] = (image_path, {e['path']: e for e in index_romfs(image_path)})
         image_path, entries = images[title]
         require(filename in entries, f'{filename} missing in {title}')
@@ -194,8 +198,11 @@ def main():
     for image_path, _ in images.values():
         image_path.unlink()
     manifest = dict(status='pass', integrity='NCA FS header and six IVFC levels verified per NCA; BFTTF header decodes to an sfnt font; RSA not checked', fonts=report)
+    manifest['retail_signatures_verified'] = args.verify_retail_signatures
+    if args.verify_retail_signatures:
+        manifest['integrity'] = 'Retail NCA RSA-PSS-SHA256 header signatures, FS header hashes, six IVFC levels and BFTTF headers verified'
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-    print(json.dumps(dict(status='pass', fonts=[(r['type'], r['font_bytes']) for r in report])))
+    print(json.dumps(dict(status='pass', fonts=[(r['type'], r['font_bytes']) for r in report], retail_signatures_verified=args.verify_retail_signatures, sha256={r['name']: r['sha256'] for r in report})))
 
 
 if __name__ == '__main__':

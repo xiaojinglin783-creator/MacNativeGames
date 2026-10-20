@@ -157,3 +157,16 @@ bounds and the retail signature during every build, including cached extraction.
 Other metadata digests remain rejected; program-module and game-data hash checks
 are unchanged. No supplied game metadata or console/decryption key is committed.
 The verifier's public modulus is a verification key, not a game-decryption key.
+
+## Newer firmware fonts: authenticity check pending
+
+The supplied 21.2.0 extraction matches four original font digests. Its simplified
+Chinese fonts differ (`a04eb490...` and `f5784e7a...`). These digests have **not**
+been added to the accepted fonts. To distinguish a supported firmware variant
+from unverified replacements, extraction now offers `--verify-retail-signatures`.
+This verifies each source font NCA's RSA-PSS-SHA256 header signature with pinned
+hactool retail public roots, in addition to the existing FS-header and six-level
+IVFC checks. The signed header binds the FS hash to the verified RomFS bytes.
+The output manifest reports whether this stronger check completed. Existing
+font allowlists and runtime integrity checks remain unchanged while awaiting
+that local check. No font payload or console/decryption key is committed.
