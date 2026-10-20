@@ -170,3 +170,22 @@ IVFC checks. The signed header binds the FS hash to the verified RomFS bytes.
 The output manifest reports whether this stronger check completed. Existing
 font allowlists and runtime integrity checks remain unchanged while awaiting
 that local check. No font payload or console/decryption key is committed.
+
+## Verified 21.2.0 font variants
+
+The target Mac completed `--verify-retail-signatures` successfully for all five
+source font NCAs. Retail signatures, FS header hashes, all six IVFC levels and
+BFTTF headers verified, and the resulting six file digests match the previously
+reported extraction. Four match the original font set. Two additional exact
+variants are now supported:
+
+| Type | File bytes (including BFTTF header) | SHA-256 |
+|---|---:|---|
+| chinese-simplified | 7848208 | `a04eb490283d8393b2c49c52e315132461d790ac73996cb43ac869ce72003938` |
+| chinese-simplified-extension | 123920 | `f5784e7a553fef9a05b3b7dba94e77e79162ace9db8dafc715ace0be1fd9b9ff` |
+
+The original font references remain unchanged. The variant must match its type,
+exact digest and size. The generated manifest and runtime header record the
+actual selected file's digest/size, so the existing runtime checksum protection
+continues to apply. No font payload is included in the repository. This confirms
+font input integrity; gameplay and glyph appearance still need target validation.

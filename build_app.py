@@ -263,6 +263,15 @@ def identify_update(tree, game, keys, logs):
     return version, source
 
 
+# Additional firmware fonts verified on the target Mac with retail NCA RSA
+# signatures, FS-header hashes and all IVFC levels (2026-10-21). Keep the
+# original reference set and bind each accepted variant's actual digest/size.
+VERIFIED_FONT_VARIANTS = {
+    'chinese-simplified': ('a04eb490283d8393b2c49c52e315132461d790ac73996cb43ac869ce72003938', 7848208),
+    'chinese-simplified-extension': ('f5784e7a553fef9a05b3b7dba94e77e79162ace9db8dafc715ace0be1fd9b9ff', 123920),
+}
+
+
 def font_report(folder):
     """Only known font bytes can be bound into this version's runtime."""
     rows = []
@@ -270,9 +279,11 @@ def font_report(folder):
         path = folder / f'{kind}-{name}.bfttf'
         if not path.is_file():
             raise BuildError(f'missing shared font: {path}')
-        check(f'shared font {name}', sha256(path), expected)
+        actual = sha256(path)
         size = path.stat().st_size
-        rows.append(dict(type=kind, name=name, bfttf_bytes=size, font_bytes=size - 8, sha256=expected))
+        if actual != expected and VERIFIED_FONT_VARIANTS.get(name) != (actual, size):
+            check(f'shared font {name}', actual, expected)
+        rows.append(dict(type=kind, name=name, bfttf_bytes=size, font_bytes=size - 8, sha256=actual))
     return dict(status='pass', integrity='Each shared font matches the verified SHA-256 for this build', fonts=rows)
 
 
