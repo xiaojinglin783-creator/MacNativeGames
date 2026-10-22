@@ -32,7 +32,9 @@ int main(void) { @autoreleasepool {
     uint8_t control[0x880] = {0}, code[0x80] = {0};
     uint32_t start = 0x50, length = sizeof code;
     memcpy(control+0x700, &start, 4); memcpy(control+0x704, &length, 4);
-    NSDictionary *answers = @{@"tex":@{}, @"img":@{}, @"attr":@{}, @"fout":@{}};
+    // The fake reflection copies these dependencies. An empty tex map means
+    // the shader never queried a texture type and can also serve cube bindings.
+    NSDictionary *answers = @{@"tex":@{@"0":@"2d"}, @"img":@{}, @"attr":@{}, @"fout":@{}};
     NSString *a = [NSString stringWithFormat:@"%064d", 1];
     assert(totk_rt_variant(a,0,control,code,answers,nil,1) == nil);
     assert(dispatch_semaphore_wait(entered,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)) == 0);
