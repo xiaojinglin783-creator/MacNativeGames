@@ -26,6 +26,7 @@
 #include "nvn_hmap.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
+#include "nvn_frame_limit.h"
 #include "nvn_diag_range.h"
 #include "../../host/front.h"
 #include "nvn_dirty.h"
@@ -2428,6 +2429,14 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 | 
 // DM_PRESENT_HZ=0 (uncapped frame rate) serves only as an explicit performance profiling switch: some of the game's UI logic counts frames (with the same save, uncapped gives
 // 4181 SaveIndicatorPanel entries and capped at 60 fps gives 0, which matches the ground truth), so uncapped is a semantically wrong way to run and must not be used as a criterion / cross-check / default. Unit tests set it directly with nvn_present_config
 static int g_hz = -1, g_display_mode;
+static int g_frame_limit = -1;
+static int frame_limit_fps(void) {
+    if (g_frame_limit < 0) {
+        g_frame_limit = nvn_frame_limit_parse(getenv("TOTK_MAX_FPS"));
+        if (g_frame_limit) LOG("[power] render ceiling %d FPS; guest tick rate and present interval preserved", g_frame_limit);
+    }
+    return g_frame_limit;
+}
 /* TOTK_UNCAPPED (Mac and iPhone, default on; =0 off): like vsync off in other games. The game no longer waits for the display: it is
    paced by our own clock at UNCAPPED_HZ, and the display link shows the newest finished frame at every refresh (older ones
    are merged away, as when the game runs ahead). The ceiling is 120 because the real-time frame step (game_patches.c)
@@ -2490,12 +2499,14 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "补帧 不限帧：不限帧率，每帧补一帧" : "补帧 不限帧：按游戏的出图间隔，每帧补一帧") :
                                     g_uncapped ? "补帧关：不限帧率" : "补帧关：按游戏的出图间隔"); was = m; }
     if (m == MFX_30) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
-    return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    uint64_t period = hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    return nvn_frame_limit_period(period, frame_limit_fps(), uncapped_now(), dm_detclock_enabled());
 }
 /* Exercise production policy, including the shrine's interval=2 and the
    legacy 30 FPS path. No sleep, present or GPU allocation is involved. */
 void dm_nvn_probe_present_interval(void) {
     int saved_hz = g_hz, saved_display = g_display_mode, saved_uncapped = g_uncapped;
+    int saved_limit = frame_limit_fps(); g_frame_limit = 0;
     int saved_flag = atomic_load(&g_uncapped_interval), checked = 0;
     const char *neg = getenv("TOTK_PROBE_NEGATIVE");
     for (int hz = 60; hz <= 120; hz += 60) for (int uncapped = 0; uncapped < 2; uncapped++)
@@ -2539,6 +2550,20 @@ void dm_nvn_probe_present_interval(void) {
             die("present interval probe: uncapped interpolation must keep the pacing of the mode without interpolation");
         checked++;
     }
+    // A 60 FPS render ceiling keeps the 120 Hz virtual tick domain: interval 2
+    // still permits 60 FPS, interval 4 retains 30 FPS. No extra frame skipping.
+    mfx_set(MFX_OFF); mfx_latch(); g_frame_limit = 60;
+    g_hz = 120; g_paced_hz = 60; g_uncapped = 1; g_display_mode = 0;
+    atomic_store(&g_uncapped_interval, 0);
+    for (int interval = 1; interval <= 4; interval++) {
+        win_t w = {.interval = interval};
+        uint64_t base = (uint64_t)interval * 1000000000ull / 120;
+        uint64_t expected = !dm_detclock_enabled() && base < 16666667ull ? 16666667ull : base;
+        if (present_ticks(&w) != (unsigned)interval || present_period(&w) != expected)
+            die("render ceiling changed guest intervals or halved 60 FPS to 30");
+        checked++;
+    }
+    g_frame_limit = saved_limit;
     mfx_set(saved_mfx); mfx_latch();
     g_hz = saved_hz; g_paced_hz = saved_paced; g_display_mode = saved_display; g_uncapped = saved_uncapped;
     atomic_store(&g_uncapped_interval, saved_flag);

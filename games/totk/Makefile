@@ -433,6 +433,7 @@ test-opus-codec:
 .PHONY: check-metal
 check-metal: $(GFX_OBJECTS)
 	xcrun clang $(MACOS_FLAGS) -fobjc-arc -std=gnu11 -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -Iruntime -fsyntax-only $(filter-out runtime/frontend_ios.m,$(wildcard runtime/*.m))
+	xcrun clang $(MACOS_FLAGS) -fobjc-arc -std=gnu11 -Wall -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn -Iruntime -fsyntax-only app/launcher.m
 
 .PHONY: probe-metal3-arguments
 probe-metal3-arguments:

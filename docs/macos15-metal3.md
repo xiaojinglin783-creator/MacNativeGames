@@ -354,3 +354,62 @@ Existing launchers retain their input and optimization flags. Async shaders and
 the texel-region path are enabled by default; compare the same combat/traversal
 route with the window in front and report actual long-frame logs. Neither the
 Linux checks nor a successful GPU probe guarantee that every scene is stutter-free.
+
+### 2026-10-22: 60 FPS launcher defaults for reduced excess work
+
+The packaged Metal 3 launcher now defaults to `TOTK_POWER_MODE=balanced`:
+`TOTK_MAX_FPS=60`, `TOTK_GPU_KEEPALIVE=0`, `TOTK_ARG_EPOCH=1`, and
+`TOTK_M3_RESOURCE_CACHE=1`. These are defaults only: an explicitly supplied value
+wins. `TOTK_POWER_MODE=performance` restores the previous launch policy (no new
+defaults), and Metal 4 keeps its previous defaults unless balanced mode is
+explicitly requested. The launcher logs the effective ceiling and keepalive value.
+
+This is a render ceiling, not a new guest clock. Previously the default uncapped
+clock could run at 120 Hz while a 60 Hz screen showed the latest image and discarded
+older ones. Reducing `TOTK_UNCAPPED_HZ` directly can turn a two-tick interval into
+30 FPS. Instead `nvn_frame_limit_period` applies a minimum render period to the
+existing real-time uncapped pacer while keeping its virtual tick frequency and
+requested interval. At 120 Hz, both one- and two-tick intervals are limited to a
+60 FPS ceiling; a four-tick 30 FPS interval remains unchanged. This does not force
+slow scenes to render faster, skip draws, lower resolution, change the game-speed
+patch or modify input. Deterministic clocks, explicit no-pacing benchmarks,
+display-synchronised modes and MetalFX half/30 pacing retain their behavior.
+`TOTK_MAX_FPS=0` disables the new ceiling. Turning off keepalive can reduce clock
+boosting and may reduce performance in some scenes; compare rather than assuming
+that temperature or sustained FPS will improve.
+
+Changes: `build_app.py` passes the selected backend to `app/launcher.m`;
+`app/power_policy.h` supplies the defaults; `nvn_frame_limit.h` and `hle_nvn.c`
+implement the ceiling. `Makefile` checks launcher syntax; the Mac check script
+runs `tests/test_power_policy.py` and its compiled `tests/power_policy_probe.c`.
+The production present-interval probe also checks the new ceiling with the
+120 Hz virtual clock. No system power settings, game data, keys, saves, wrapper
+apps or controller mappings are edited.
+
+Linux validation: 106 tests, 94 passed and 12 skipped for unavailable platforms or
+tools. Both graphics backend audits, shell syntax and Make dry runs pass. The C
+probe checks parsing/overrides, preservation of Metal 4 defaults, the real pacer
+with two swapchain images over 600 frames, no halving of 60 to 30, and no extra
+slowdown when CPU work already exceeds the target. Native Mac compilation,
+observed frame pacing and actual thermal effects remain pending.
+
+Quit the game, pull this branch, and run `bash games/totk/scripts/check_macos_backend.sh 3`.
+After that succeeds, rebuild using the existing `build_app.py` command and output
+path. The existing wrapper will pick up the defaults on its next launch. Verify:
+
+```sh
+grep -E '\[power\]|GPU 保活|计时 至帧|上屏节奏' \
+  "$HOME/Library/Logs/MacNativeGames/totk.log" | tail -n 16
+```
+
+Compare the same combat/traversal route after 10–15 minutes under similar ambient
+conditions. To compare against the prior behavior (or if frame pacing gets worse):
+
+```sh
+TOTK_POWER_MODE=performance TOTK_FACE_BUTTONS=position \
+  TOTK_ARG_EPOCH=1 TOTK_M3_RESOURCE_CACHE=1 \
+  "$HOME/TOTK Metal3.app/Contents/MacOS/TOTK"
+```
+
+Fanless hardware can still become warm at 60 FPS; these code changes are not a
+promise of low surface temperature or a guaranteed FPS increase.

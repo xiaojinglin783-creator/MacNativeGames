@@ -657,7 +657,7 @@ def step_binary(tree, game, keys, env, logs, *, version="v0"):
     flags = ['-arch', 'arm64', f'-mmacosx-version-min={target}']
     jobs = min(os.cpu_count() or 4, 4)  # 16 GB Macs: avoid compiling every large graphics unit concurrently.
     run(['make', f'-j{jobs}', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
-    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', *flags, '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
+    run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', *flags, f'-DDM_NVN_M3={int(env.get("METAL_BACKEND") == "3")}', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *([] if version == 'v0' else [f'-DTOTK_GAME_{version.upper()}=1']), 'app/launcher.m', '-framework', 'AppKit',
          '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
     # used only while packaging (step_warm_metal); not part of the app
     run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', *flags, 'tools/warm_metal_cache.m', '-framework', 'Metal',

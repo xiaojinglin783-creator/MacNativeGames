@@ -16,6 +16,10 @@
 #include "dmsh_chain.h"   // DMSH_CHAIN: the shader translation chain the cache folder is named after
 #include "game_version.h"
 #include "controller_map.h"
+#include "power_policy.h"
+#ifndef DM_NVN_M3
+#define DM_NVN_M3 0
+#endif
 #include "include/totk_ui_lang.h"
 #include "totk_shader_contrib.h"   // the shared shader list contribution and its reminder
 
@@ -190,6 +194,10 @@ int main(int argc, char **argv) {
             dup2(fileno(lf), STDOUT_FILENO);
             dup2(fileno(lf), STDERR_FILENO);
             fclose(lf);
+        }
+        if (totk_power_defaults(DM_NVN_M3)) {
+            fprintf(stderr, "[power] balanced: render ceiling=%s, GPU keepalive=%s (explicit overrides preserved)\n",
+                    getenv("TOTK_MAX_FPS"), getenv("TOTK_GPU_KEEPALIVE"));
         }
         char *const arguments[] = {(char *)binary.fileSystemRepresentation, "rewritten/" TOTK_GAME_DIR, "boot", NULL};
         execv(arguments[0], arguments);
