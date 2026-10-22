@@ -4,6 +4,10 @@
 #include <stdatomic.h>
 #include <unistd.h>
 #include "totk_shader_rt.h"
+/* The standalone executable has no boot-screen frontend. Resolve its optional
+   progress hooks explicitly; weak_import alone does not satisfy this linker. */
+void runtime_boot_status(const char *stage, const char *detail) { (void)stage; (void)detail; }
+void runtime_boot_count(const char *stage, uint64_t done, uint64_t total) { (void)stage; (void)done; (void)total; }
 int totk_depth_near_minus_w(void) { return 0; }
 uint64_t dm_nvn_frame_count(void) { return 1; }
 static dispatch_semaphore_t entered, release_hook;
