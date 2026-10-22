@@ -277,3 +277,80 @@ argument probe now also checks real Metal buffer offsets, removal, re-insertion,
 and last-hit validity after sorted entries shift. Repeat that probe on the Mac
 after rebuilding. Both API branch audits and the 102-test Python suite passed
 (11 platform/tool-dependent skips); native validation/performance remain pending.
+
+### 2026-10-22: scoped upstream stutter backport
+
+This branch backports the following changes from `ly05010419/MacNativeGames`,
+without merging unrelated game ports, changing the translation chain, or enabling
+newer MetalFX features:
+
+- `646ce29`: opt-in cached shader library prefetch (`TOTK_SHADER_PREFETCH=1`).
+- `b5cbbca`: bounded pipeline prediction rescans; in-flight slots remain protected.
+- `bfdd085`: background translation/library/pipeline preparation on Mac. Pure
+  colour draws may appear a few frames late while their shaders compile. Compute,
+  storage-writing/stream-output programs, occlusion-counting draws and persistent
+  cube/array/3D targets keep the synchronous correctness path.
+- `bc461fc`: look ahead and prioritise required shader jobs on separate services.
+- Relevant parts of `7305d4e`: background jobs own their code bytes and write the
+  code file themselves; prediction checks the clock every 64 commands.
+- `42d3c4f` (Dormon Zhou): GPU conversion of texel subregions with CPU fallback,
+  bounds/overlap guards and a production read/write GPU probe.
+
+The async shader commits are authored by Yong Li and the prefetch commit by
+lakuch; see their original commit messages for measurements. Those measurements
+are not validation of this macOS 15 backport. This port keeps the conservative
+occlusion-query behavior; it does not import `311f7ec`'s query-result substitution,
+the newer border-colour pipeline machinery, or the pipeline archive dependency.
+
+Metal 3 keeps the previous argument reuse/resource-declaration switches and
+binary-search buffer registry. Background and urgent translators default to two
+services each on Metal 3 for the 16 GB target (four each on Metal 4); adjust with
+`TOTK_RT_BG_WORKERS` / `TOTK_RT_URGENT_WORKERS` (1–8). Fewer workers may make newly
+encountered objects appear later. Child processes get an empty signal mask and
+close-on-exec file descriptors so background service pipes do not hang.
+`TOTK_ASYNC_SHADERS=0` disables async draw skipping; `TOTK_TEXELS_GPU=0` returns to
+the CPU texel conversion path. Cached-library prefetch remains opt-in because it
+can compile variants never used and increase CPU/memory load.
+
+Changed production files:
+`games/totk/Makefile`, `runtime/loader.c`, `runtime/gpu_path_probe.m`,
+`third_party/d2r_gfx/gfx/nvn/{hle_nvn.c,nvn_mtl.h,nvn_mtl.m,nvn_obj.h,totk_shader_rt.h,totk_shader_rt.m}`,
+and `third_party/d2r_gfx/gfx/tex/{nvn_deswizzle_gpu.h,nvn_deswizzle_gpu.m}`.
+Tests/checks: `scripts/check_macos_backend.sh`, `nvn_texels_region_probe.h`,
+`tests/async_shaders/probe.m`, and repository-level
+`tests/test_async_shader_{policy,rt}.py`. Documentation also updates
+`docs/pipeline-prediction-stalls.md` and this file. No game/key/save files change.
+
+Validation in Linux: both backend API audits, shell syntax and Make dry runs
+pass; 104 Python tests run, 92 pass and 12 skip because Apple APIs or another
+platform/tool are unavailable. The portable safety test compiles the actual SPH
+classifier. The Apple-only queue test exercises production Objective-C with a
+synthetic translator in a temporary folder (no game data/keys): publication only
+after the callback, duplicate requests, urgent work, synchronous adoption and
+child signal/pipe setup. Native compilation and GPU/gameplay verification remain
+pending on the user's Mac.
+
+First, quit the game and check compilation plus the isolated queue test:
+
+```sh
+cd "$HOME/MacNativeGames"
+git pull --ff-only
+bash games/totk/scripts/check_macos_backend.sh 3
+```
+
+Then use the existing `build_app.py ... --metal-backend 3` command and unchanged
+work/output paths. With the rebuilt 1.4.3 executable, run the probes separately:
+
+```sh
+cd "$HOME/TOTK_build_metal3/totk"
+MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=assert TOTK_HEADLESS=1 \
+  TOTK_M3_RESOURCE_CACHE=1 \
+  ./build/totk-native-v143 rewritten/v143 probe-gpu-arg-epoch
+MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=assert TOTK_HEADLESS=1 \
+  ./build/totk-native-v143 rewritten/v143 probe-gpu-texels-region
+```
+
+Existing launchers retain their input and optimization flags. Async shaders and
+the texel-region path are enabled by default; compare the same combat/traversal
+route with the window in front and report actual long-frame logs. Neither the
+Linux checks nor a successful GPU probe guarantee that every scene is stutter-free.

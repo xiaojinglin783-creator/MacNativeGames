@@ -16,6 +16,9 @@ log="$PWD/build/check-metal${backend}.log"
   xcrun --sdk macosx --show-sdk-version
   xcrun clang --version
   make -j2 "METAL_BACKEND=$backend" check-metal
-  if [[ "$backend" == 3 ]]; then make METAL_BACKEND=3 probe-metal3-arguments; fi
+  if [[ "$backend" == 3 ]]; then
+    make METAL_BACKEND=3 probe-metal3-arguments
+    python3 -m unittest discover -s ../../tests -p test_async_shader_rt.py -v
+  fi
   echo "PASS: Metal $backend native graphics compilation and applicable GPU smoke check"
 } 2>&1 | tee "$log"

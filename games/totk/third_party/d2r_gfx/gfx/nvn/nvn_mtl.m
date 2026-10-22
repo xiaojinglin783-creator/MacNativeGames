@@ -4786,7 +4786,8 @@ static int sh_has_src(NvShader *s) { return s && (s->src || s->src_path); }
     // TOTK: translation inputs and the variant per bound-state signature (prog_fit)
     const uint8_t *ctl[6], *code[6]; NSString *key[6]; uint64_t sig[6]; NSMutableDictionary<NSNumber *, NvShader *> *alt[6];
     void *udc_sh[6]; uint8_t udc_ok, udc_img, udc_imgw; uint32_t udc_cmask;   // udc_*: udc_note_draw's summary of sh[] (valid while sh[] is the same)
-    int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip; } @end   // TOTK (iOS): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip)
+    int missing, miss_has[2]; uint64_t miss_sig[2]; int exp_skip;
+    int keeps; uint64_t miss_gen; } @end   // TOTK (iOS, Mac async shaders): missing = stages whose variant is not translated yet; miss_sig: signature whose variant is missing (prog_fit); exp_skip: TOTK_EXP_SKIP_FS decision (0 unknown, 1 keep, 2 skip); keeps: a stage stores to memory or streams out (sph_keeps_memory), its draws are never skipped; miss_gen: totk_rt_ready_gen() when a stage was last found missing
 @implementation NvProg @end
 /* TOTK_EXP_SKIP_FS=<fragment key prefix>[,<prefix>...] (measurement only, 2026-10-16): drop every draw whose fragment shader key
    starts with one of the prefixes. A render pass whose draws are all dropped is never opened, so the GPU time saved is the
@@ -5175,17 +5176,65 @@ static int rt_range_pr_ro(NvProg *p) {
     for (int k=0;k<6;k++) if (p->sh[k] && (k>1 || p->sh[k]->stage != k || !p->sh[k]->range_ro || p->sh[k]->rf.drv_read[0] || p->sh[k]->rf.drv_read[2])) return 0;
     return 1;
 }
+/* Libraries compiled by the background translation (async shaders), until shader_get takes them on the submit thread. */
+static NSMutableDictionary<NSString *, NvShader *> *g_async_libs;
+static os_unfair_lock g_async_lock = OS_UNFAIR_LOCK_INIT;
+static void async_ready(NSString *variant, int stage) {   // a translator worker (totk_rt_set_ready_hook)
+    NSString *pc = [variant stringByAppendingString:@"_b"];
+    NvShader *sh = shader_load(pc, stage);   // safe on several threads at once (the warm-up loads with it)
+    if (!sh) return;   // shader_get loads it again on the submit thread and reports the failure there
+    os_unfair_lock_lock(&g_async_lock);
+    if (!g_async_libs) g_async_libs = [NSMutableDictionary dictionary];
+    g_async_libs[pc] = sh;
+    os_unfair_lock_unlock(&g_async_lock);
+}
+static NvShader *async_take(NSString *pc) {
+    os_unfair_lock_lock(&g_async_lock);
+    NvShader *sh = g_async_libs[pc]; if (sh) [g_async_libs removeObjectForKey:pc];
+    os_unfair_lock_unlock(&g_async_lock);
+    return sh;
+}
+/* Async shaders (Mac default, user 2026-10-21; TOTK_ASYNC_SHADERS=0 turns them off): a new shader variant or pipeline is
+   prepared in the background and the draws that need it are skipped until it is ready, the way games that stream their
+   content show it a few frames later, instead of stopping the frame. Work whose result outlives the draw is never
+   skipped: compute, draws without a colour output (depth and shadow passes) and programs that store to memory or stream
+   out (sph_keeps_memory). Those wait for the background job instead (prog_resolve). Off with the experimental TBDR pass
+   rewriting (DM_NVN_TBDR=1): its load / store planning assumes every draw it planned is drawn. */
+static int async_shaders(void) {
+#if TARGET_OS_IPHONE
+    return 0;   // no translator on the device: missing variants are skipped anyway
+#else
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("TOTK_ASYNC_SHADERS");
+        on = !(e && !strcmp(e, "0")) && totk_rt_can_translate() && !tbdr_on();
+        if (on) totk_rt_set_ready_hook(async_ready);
+        MLOG("[async-shaders] %s", on ? "on: new shaders and pipelines are prepared in the background" : "off");
+    }
+    return on;
+#endif
+}
+/* The Maxwell shader program header (SPH, after the 0x30-byte NVN header of graphics code) says whether a stage stores to
+   global memory, surfaces included (word 0 bit 16, DoesGlobalStore) or streams out (bits 28-31). Checked 2026-10-21 on
+   all 20,129 graphics variants of the 1.4.3 seed: every one whose MSL stores through a storage buffer, writes a texture or
+   uses an atomic has the bit (one more has it without storing). Compute is always treated as storing. */
+static int sph_keeps_memory(const uint8_t *code, int st) {
+    if (st != 0 && st != 1) return 1;
+    uint32_t w0; memcpy(&w0, code + 0x30, 4);
+    return (w0 >> 16 & 1) || (w0 >> 28 & 0xf);
+}
 static NvShader *shader_get(NSString *pc, int stage) {
     if (!g_shcache) g_shcache = [NSMutableDictionary dictionary];
     NvShader *o = g_shcache[pc];
     if (o) return o;
-    uint64_t bt = bp_now(); o = shader_load(pc, stage);
+    uint64_t bt = bp_now(); o = async_take(pc); int taken = o != nil;   // compiled in the background (logged with its translation)
+    if (!o) o = shader_load(pc, stage);
     if (!o) { if (survey_shader_log()) MLOG("[survey-shader] frame %llu Metal library FAILED stage %d %s after %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), stage, pc.UTF8String, (bp_now() - bt) / 1e6); return nil; }
     g_shcache[pc] = o;
     pso_record("S\t%s\t%d\n", pc.UTF8String, stage);
     pso_user_record("S\t%s\t%d\n", pc.UTF8String, stage);
     g_bp_lib_n++; g_bp_lib_ns += bp_now() - bt;
-    if (survey_shader_log()) MLOG("[survey-shader] frame %llu Metal library stage %d %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), stage, pc.UTF8String, (bp_now() - bt) / 1e6);
+    if (survey_shader_log() && !taken) MLOG("[survey-shader] frame %llu Metal library stage %d %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), stage, pc.UTF8String, (bp_now() - bt) / 1e6);
     return o;
 }
 static NSDictionary *rt_answers(int st);
@@ -5194,6 +5243,24 @@ static uint64_t stage_sig(int st);
    restores copy earlier states), so they are 0 and stage_sig compares only the slots below it (it compared all 128). */
 static int g_tex_hi[6] = {1, 1, 1, 1, 1, 1};
 static NSArray *rt_local(const uint8_t *control, int st);
+/* How much of a control section the shader key hashes: the section's own size, the word at +0x20 (0x880 in TOTK's
+   archives and in its agl packages; 0x7d1 and 0x848 in Breath of the Wild, whose game keeps each section in its own
+   allocation, so the bytes after it are not the shader's and differ from the archive's), never more than 0x880.
+   scripts/prepare_shader_seed.py control_key_len computes the same offline. */
+static inline uint32_t ctl_key_len(const uint8_t *control) { uint32_t n; memcpy(&n, control + 0x20, 4); return n >= 0x7cc && n < 0x880 ? n : 0x880; }
+static int draw_state_may_skip(void);
+static uint64_t async_fresh(void);
+static void async_why(const NvProg *pr, uint64_t fresh_before);
+/* prog_get for the draw itself (draw_inner), not for a planning walk ahead of it: a stage of a draw that may not be
+   skipped is translated at once rather than queued behind other background jobs. */
+static int g_prog_for_draw;
+static void prog_stage_set(NvProg *o, int st, NSString *variant) {   // a translated stage (ctl / code / key already set)
+    NvShader *sh=shader_get([variant stringByAppendingString:@"_b"],st);
+    if(!sh)MDIE("TOTK shader translation/reflection unavailable for %s",variant.UTF8String);
+    o->sh[st]=sh; o->sig[st]=stage_sig(st); o->alt[st]=[NSMutableDictionary dictionaryWithObject:sh forKey:@(o->sig[st])];
+}
+static int g_prog_prefetch;   // prog_get called by shader_predict_rest: every stage is translated in the background
+static void shader_predict_maybe(void);
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提交线程调用 | Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // 上次结果：同一对象、同一序号且序号表未变即直接用 | Last result: same object, same serial and unchanged serial table means it is used directly
@@ -5202,7 +5269,14 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
     __unsafe_unretained NvProg *have = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
     if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
     shmap_load();
+    if (g_prog_for_draw) shader_predict_maybe();   // a program met for the first time: the rest of the submission may bring more
     NvProg *o = [NvProg new];
+    for (unsigned i = 0; i < p->nstage; i++) {   // a stage that stores or streams out keeps every draw of the program
+        uint32_t nvn_stage = 0; if (!p->sd[i].control || !p->sd[i].data) MDIE("null TOTK shader binary");
+        memcpy(&nvn_stage, (const uint8_t *)p->sd[i].control + 0x714, 4);
+        o->keeps |= sph_keeps_memory((const uint8_t *)(uintptr_t)p->sd[i].data, (int)nvn_stage);
+    }
+    int defer = async_shaders() && (g_prog_prefetch || (!o->keeps && (!g_prog_for_draw || draw_state_may_skip()))); o->miss_gen = totk_rt_ready_gen();
     for (unsigned i = 0; i < p->nstage; i++) {
         const uint8_t *control=p->sd[i].control;uint32_t length=0,nvn_stage=0;
         if (!control || !p->sd[i].data) MDIE("null TOTK shader binary");
@@ -5218,12 +5292,12 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
             for (int k = 0x6c0; k < 0x880; k += 4) { uint32_t w; memcpy(&w, control + k, 4); if (w) o += snprintf(b + o, sizeof b - o, " %03x:%x", k, w); }
             o += snprintf(b + o, sizeof b - o, " | code:"); for (int k = 0; k < 0x30; k += 4) { uint32_t w; memcpy(&w, cd + k, 4); o += snprintf(b + o, sizeof b - o, " %x", w); }
             MLOG("[ctl st%d]%s", st, b); } }
-        NSString *variant=totk_rt_variant(@(key),st,control,(const uint8_t *)(uintptr_t)p->sd[i].data,rt_answers(st),rt_local(control,st));
-        if(!variant){o->missing|=1<<st;o->ctl[st]=control;o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data;o->key[st]=@(key);continue;}   // iOS: not translated yet, its draws are skipped
-        NvShader *sh=shader_get([variant stringByAppendingString:@"_b"],st);
-        if(!sh)MDIE("TOTK shader translation/reflection unavailable for %s",variant.UTF8String);
-        o->sh[st]=sh; o->ctl[st]=control; o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data; o->key[st]=@(key);
-        o->sig[st]=stage_sig(st); o->alt[st]=[NSMutableDictionary dictionaryWithObject:sh forKey:@(o->sig[st])];
+        o->ctl[st]=control; o->code[st]=(const uint8_t *)(uintptr_t)p->sd[i].data; o->key[st]=@(key);
+        uint64_t f0 = async_fresh();
+        NSString *variant=totk_rt_variant(@(key),st,control,o->code[st],rt_answers(st),rt_local(control,st),defer);
+        if (!defer && g_prog_for_draw) async_why(o, f0);
+        if(!variant){o->missing|=1<<st;continue;}   // iOS: not translated yet; Mac (async shaders): translating in the background. Its draws are skipped
+        prog_stage_set(o,st,variant);
     }
     if (p->serial) serial_put(p->serial, o);
     return o;
@@ -5765,16 +5839,77 @@ static uint64_t stage_sig(int st) {
 }
 // The same program can draw into float and integer targets or read differently typed attributes: pick (or translate)
 // the variant for the current signature. Returns 1 when a stage changed.
+/* Async shaders: whether this draw may be skipped while its shader or pipeline is prepared in the background. Its
+   program does not store or stream out (draw_may_skip), it writes colour (its own target's channel mask) into a plain 2D
+   target, which scene passes redraw every frame, so a skipped draw comes back when it is drawn again. Not while an
+   occlusion counter counts (the game culls by the samples it reads back), nor into cube, array or 3D targets (probes,
+   atlases updated now and then could keep the gap). A draw the replay drops anyway (rendering disabled, rasterizer
+   discard) never waits. */
+static int draw_state_may_skip(void) {
+    if (!async_shaders() || g_vis_counting || !R.has_rt) return 0;
+    if (S.render_disabled || S.raster_discard) return 1;
+    for (int i = 0; i < R.rt.n && i < 8; i++) {
+        const tex_t *t = R.rt.color[i]; uint32_t g = t ? t->d.target : 0;
+        if (t && (S.chmask.mask >> (4 * i) & 0xf) && (g == NVN_TEXTURE_TARGET_2D || g == NVN_TEXTURE_TARGET_2D_MULTISAMPLE || g == NVN_TEXTURE_TARGET_RECTANGLE)) return 1;
+    }
+    return 0;
+}
+static int draw_may_skip(const NvProg *pr) { return !pr->keeps && draw_state_may_skip(); }
+/* TOTK_ASYNC_WHY=1 (diagnostic): why a new variant was translated on the spot instead of in the background, counted per
+   reason and logged every 100: the program stores, an occlusion counter counts, no render target, no colour written, or
+   colour only into cube / array / 3D targets. */
+static uint64_t async_fresh(void) { uint64_t f = 0; totk_rt_counts(&f, NULL, NULL); return f; }
+static void async_why(const NvProg *pr, uint64_t fresh_before) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_ASYNC_WHY"); on = e && !strcmp(e, "1"); }
+    if (!on || !async_shaders() || async_fresh() == fresh_before) return;   // only variants translated by this call
+    static uint64_t n[6], total;
+    int why = pr && pr->keeps ? 0 : g_vis_counting ? 1 : !R.has_rt ? 2 : 3;
+    if (why == 3) { int color = 0; for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i] && (S.chmask.mask >> (4 * i) & 0xf)) color = 1; why = color ? 4 : 3; }
+    n[why]++;
+    if (++total % 100 == 0) MLOG("[async-why] 当场翻译 %llu 个：程序写内存 %llu，遮挡计数中 %llu，无渲染目标 %llu，不写颜色 %llu，只写立方体 / 数组 / 3D %llu",
+        (unsigned long long)total, (unsigned long long)n[0], (unsigned long long)n[1], (unsigned long long)n[2], (unsigned long long)n[3], (unsigned long long)n[4]);
+}
+/* A draw skipped while its shader is prepared in the background still does to its colour targets what opening its pass
+   would (rp_begin_ex): their Metal textures are made here on the submit thread, and they are owned by the GPU, since the
+   game counts them as rendered. An unowned render target in a pool nobody tracks is uploaded again from the pool bytes on
+   every use (first test: 11,304 re-uploads by frame 300, the GPU budget of 5,000 MB exceeded during the load). */
+static void async_skip_targets(void) {
+    if (!async_shaders() || !R.has_rt) return;
+    for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i]) {
+        (void)attachment_texture(R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
+        gpu_owned_mark(R.rt.color[i]->serial);
+    }
+}
+/* A program with a stage in the background (async shaders): look again once a background job has been recorded, or
+   wait for the job when this draw may not be skipped (totk_rt_variant without may_defer). */
+static void prog_resolve(NvProg *pr, int may_skip) {
+    uint64_t gen = totk_rt_ready_gen();
+    if (may_skip && gen == pr->miss_gen) return;
+    for (int st = 0; st < 6; st++) {
+        if (!(pr->missing >> st & 1) || !pr->key[st]) continue;
+        uint64_t f0 = async_fresh();
+        NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), rt_local(pr->ctl[st], st), may_skip);
+        if (!may_skip) async_why(pr, f0);
+        if (!variant) continue;
+        prog_stage_set(pr, st, variant); pr->missing &= ~(1 << st); g_pso_dirty = 1;
+    }
+    pr->miss_gen = gen;
+}
 static int prog_fit(NvProg *pr) {
     int changed = 0;
     for (int st = 0; st < 2; st++) {
         if (!pr->sh[st] || !pr->key[st]) continue;
         uint64_t sg = stage_sig(st); if (sg == pr->sig[st]) continue;
-        if (pr->miss_has[st] && sg == pr->miss_sig[st]) return -1;
         NvShader *v = pr->alt[st][@(sg)];
+        int may_skip = v ? 0 : draw_may_skip(pr); uint64_t gen = totk_rt_ready_gen();
+        if (!v && pr->miss_has[st] && sg == pr->miss_sig[st] && (!async_shaders() || (may_skip && gen == pr->miss_gen))) return -1;
         if (!v) {
-            NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), nil);
-            if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; return -1; }   // iOS: this signature's variant is not translated yet
+            shader_predict_maybe();
+            uint64_t f0 = async_fresh();
+            NSString *variant = totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), nil, may_skip);
+            if (!may_skip) async_why(pr, f0);
+            if (!variant) { pr->miss_sig[st] = sg; pr->miss_has[st] = 1; pr->miss_gen = gen; return -1; }   // iOS: this signature's variant is not translated yet; Mac (async shaders): translating in the background
+            if (pr->miss_has[st] && sg == pr->miss_sig[st]) pr->miss_has[st] = 0;
             v = shader_get([variant stringByAppendingString:@"_b"], st);
             if (!v) MDIE("TOTK shader translation/reflection unavailable for %s", variant.UTF8String);
             pr->alt[st][@(sg)] = v;
@@ -6219,10 +6354,16 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
 // ---- Parallel precompile: pipelines met for the first time used to be compiled synchronously one by one on the submit thread; 9 misses in a row in one frame = 284 ms (heavy scene on a real device).
 // Now: on the first pipeline miss in a submission, scan ahead once along the remaining commands (replaying state only, no drawing) and kick all the normal-pass pipelines that will also miss later to the background to compile in parallel;
 // when the submit thread reaches that draw it only waits for 'the remaining time not yet compiled'. The compiled pipelines are identical to synchronously compiled ones (same descriptor). Pipeline keys of merged passes / specialized fragments depend on the planning result at replay time, are not predicted, and are compiled synchronously as before.
-#define PSO_PEND_MAX 384
+#define PSO_PEND_MAX 768
 static struct { pso_key k; id<MTLRenderPipelineState> ps; uint64_t submit; int used, done; } g_pp[PSO_PEND_MAX];
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
+/* TOTK: a scan that stopped at a budget leaves the rest of the submission unscanned; the next miss of the submission scans
+   again from there (keys already compiling are skipped, so each scan moves on), up to PSO_RESCANS times. A burst of new
+   pipelines (265 in one frame on entering a new area) then compiles in parallel instead of mostly one after another.
+   TOTK_PSO_RESCANS sets the limit (0: one scan per submission, as before). */
+static int pso_rescans(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PSO_RESCANS"); v = e ? atoi(e) : 32; if (v < 0) v = 0; } return v; }
+static int g_pp_more, g_pp_rescans; static uint64_t g_pp_sync;   // last scan stopped at a budget; scans after the first; pipelines compiled on the submission thread
 // Statistics line (pso_predict_rest, every 100 scans): guesses refused because the table was full, stale guesses freed,
 // time draws waited for a background compile, scans and which budget ended them.
 static uint64_t g_pp_full, g_pp_reclaimed, g_pp_waits, g_pp_wait_ns, g_pp_scans, g_pp_scan_ns, g_pp_stop[3];
@@ -6261,8 +6402,64 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交�
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
+static int pso_pend_state(const pso_key *k) {   // -1 not predicted, 0 compiling, 1 compiled
+    pthread_mutex_lock(&g_pp_mu);
+    int at = pso_pend_find(k), state = at < 0 ? -1 : g_pp[at].done;
+    pthread_mutex_unlock(&g_pp_mu);
+    return state;
+}
+/* A new pipeline into the cache and the warm lists (submit thread). */
+static void pso_adopt(const pso_key *k, NvShader *vs, NvShader *fs, int border, int merged, id<MTLRenderPipelineState> ps, uint64_t bt, int bg) {
+    (void)border; pso_key rk = *k;   // the warm-up list records the plain pipeline: a border variant is built from the draw's samplers
+    pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&rk, vs, fs, merged, merged ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
+    if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms%s", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6, bg ? " (background, from queued to adopted)" : "");
+    pso_record("R\t%s\n", shex);
+    pso_user_record("R\t%s\n", shex);
+    hm_put_id(&g_pso, k, ps);
+}
+/* Async pipelines (async shaders): a draw that may be skipped (draw_may_skip) does not wait for a new pipeline. It is
+   compiled on a background queue from the same descriptor and adopted by the submit thread (apso_claim); until then
+   pso_get returns nil with g_pso_deferred set and the draw is skipped. Merged-pass pipelines are not deferred. */
+@interface ApsoItem : NSObject { @public pso_key k; NvShader *vs, *fs; int border; id<MTLRenderPipelineState> ps; NSError *e; uint64_t bt; } @end
+@implementation ApsoItem @end
+static nvn_hmap g_apso_wait = {.klen = sizeof(pso_key)};   // submit thread: keys compiling (@YES) or failed (kCFNull)
+static NSMutableArray<ApsoItem *> *g_apso_done;
+static os_unfair_lock g_apso_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic int g_apso_ready;
+static int g_pso_deferred;
+#define APSO_QUEUES 4
+static void apso_claim(void) {
+    if (!atomic_exchange(&g_apso_ready, 0)) return;
+    os_unfair_lock_lock(&g_apso_lock); NSArray<ApsoItem *> *done = g_apso_done; g_apso_done = nil; os_unfair_lock_unlock(&g_apso_lock);
+    for (ApsoItem *it in done) {
+        if (it->ps) { hm_del_id(&g_apso_wait, &it->k); pso_adopt(&it->k, it->vs, it->fs, it->border, 0, it->ps, it->bt, 1); continue; }
+        hm_put_id(&g_apso_wait, &it->k, (__bridge id)kCFNull);   // later draws build it synchronously and report the failure as before
+        static int said; if (said++ < 12) MLOG("【红】后台建渲染管线失败：%s（vs %s ps %s）", it->e.localizedDescription.UTF8String, it->vs->key, it->fs ? it->fs->key : "-");
+    }
+}
+static int apso_defer(const pso_key *k, NvShader *vs, NvShader *fs, id<MTLFunction> bfn) {
+    id waiting = hm_get_id(&g_apso_wait, k);
+    if (waiting) return waiting != (__bridge id)kCFNull;
+    int pend = pso_pend_state(k);   // predicted by pso_predict_rest: take it once compiled, never wait for it
+    if (pend >= 0) return !pend;
+    ApsoItem *it = [ApsoItem new]; it->k = *k; it->vs = vs; it->fs = fs; it->border = bfn != nil; it->bt = bp_now();
+    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, bfn, 0);
+    hm_put_id(&g_apso_wait, k, @YES);
+    // A few serial queues: a new area can bring hundreds of pipelines at once, which should not take every core from the game.
+    static dispatch_queue_t q[APSO_QUEUES]; static unsigned next;
+    if (!q[0]) for (int i = 0; i < APSO_QUEUES; i++) q[i] = dispatch_queue_create("totk.pipeline.background", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+    dispatch_async(q[next++ % APSO_QUEUES], ^{
+        NSError *e = nil; it->ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e]; it->e = e;
+        os_unfair_lock_lock(&g_apso_lock);
+        if (!g_apso_done) g_apso_done = [NSMutableArray array];
+        [g_apso_done addObject:it];
+        os_unfair_lock_unlock(&g_apso_lock);
+        atomic_store(&g_apso_ready, 1);
+    });
+    return 1;
+}
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) {
-    (void)unused;
+    (void)unused; g_pso_deferred = 0; apso_claim();
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
     if (!vs) { RED_ONCE(13, "程序没有顶点着色器（或未映射）"); return nil; }
     pso_key k; pso_key_fill(&k, vs, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, g_pso_lmap != NULL);
@@ -6271,22 +6468,20 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
     __unsafe_unretained id<MTLRenderPipelineState> cached = (__bridge id<MTLRenderPipelineState>)hm_get_ptr(&g_pso, &k);
     if (cached) return cached;
+    if (!g_pso_lmap && draw_may_skip(pr) && apso_defer(&k, vs, fs, nil)) { g_pso_deferred = 1; return nil; }
     id<MTLRenderPipelineState> ps;
     NSError *e = nil; uint64_t bt = bp_now();
     ps = g_pso_lmap ? nil : pso_pend_take(&k);
     if (ps) g_pp_taken++;
     else {
-        if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
+        if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; g_pp_rescans = 0; g_pp_more = 0; pso_predict_rest(); }
+        else if (g_pp_more && g_pp_rescans < pso_rescans()) { g_pp_rescans++; pso_predict_rest(); }
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, g_pso_fsfn, g_pso_lmap != NULL);
-        ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e]; g_pp_sync++;
     }
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
-    pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);
-    if (survey_shader_log()) MLOG("[survey-shader] frame %llu render pipeline %s in %.2f ms", (unsigned long long)atomic_load(&g_cur_frame), shex, (bp_now() - bt) / 1e6);
-    pso_record("R\t%s\n", shex);
-    pso_user_record("R\t%s\n", shex);
-    hm_put_id(&g_pso, &k, ps);
+    pso_adopt(&k, vs, fs, 0, g_pso_lmap != NULL, ps, bt, 0);
     return ps;
 }
 static NSString *warm_key(const char *s, size_t n) {
@@ -6423,9 +6618,61 @@ static void warm_load_rows(NSArray<NSString *> *rows, NSMutableDictionary<NSStri
 }
 static void warm_enqueue(WarmItem *item) {
     os_unfair_lock_lock(&g_warm_lock);
+    if (!g_warm_items) g_warm_items = [NSMutableArray array];
     [g_warm_items addObject:item];
     atomic_store_explicit(&g_warm_ready, 1, memory_order_release);
     os_unfair_lock_unlock(&g_warm_lock);
+}
+/* TOTK_SHADER_PREFETCH=1 (off by default): when the game hands a program its shaders (nvnProgramSetShaders, usually while
+   it loads, before the first draw), the variants of those shaders that the translation cache already holds are compiled
+   into Metal libraries on background threads and handed to the submission thread like the warm-up's (warm_claim at the
+   next submission). The first draw then finds the library instead of compiling it itself: on the starting sky island
+   the frames that stalled for a new library (65 of them, 181 libraries, 29 s in a 21-minute run) were all variants
+   already in the cache, compiled from their MSL at the draw. Variants not in the cache, and pipelines, are still made
+   at the draw as before. Nothing is translated here and no draw is skipped. */
+static int prefetch_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_SHADER_PREFETCH"); on = e && !strcmp(e, "1"); } return on; }
+static _Atomic uint64_t g_pf_progs, g_pf_queued, g_pf_built, g_pf_ns, g_pf_last;
+void mtl_prog_prefetch(const prog_t *p) {
+    if (!prefetch_on() || !p || !p->nstage) return;
+    static NSMutableSet<NSString *> *seen; static dispatch_queue_t q; static dispatch_semaphore_t slots; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+    static dispatch_once_t once; dispatch_once(&once, ^{
+        seen = [NSMutableSet set];
+        q = dispatch_queue_create("totk.shader-prefetch", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0));
+        slots = dispatch_semaphore_create(4);   // the system compiler service runs requests side by side; 4 leaves cores to the game
+        MLOG("[prefetch] 着色器预编已开（TOTK_SHADER_PREFETCH=1）：游戏设着色器时，后台编翻译缓存里已有的变体，最多 4 个同时编");
+    });
+    atomic_fetch_add(&g_pf_progs, 1);
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+        const uint8_t *control = p->sd[i].control; uint32_t length = 0, st = 0;
+        if (!control || !p->sd[i].data) continue;
+        memcpy(&length, control + 0x704, 4); memcpy(&st, control + 0x714, 4);
+        if (!length || length > 16 * 1024 * 1024 || (st != 0 && st != 1 && st != 5)) continue;
+        /* the same key prog_get computes: control section, then the code */
+        uint8_t md[32]; CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx); CC_SHA256_Update(&ctx, control, ctl_key_len(control));
+        CC_SHA256_Update(&ctx, (const void *)(uintptr_t)p->sd[i].data, length); CC_SHA256_Final(md, &ctx);
+        char key[65]; for (unsigned j = 0; j < 32; j++) snprintf(key + 2 * j, 3, "%02x", md[j]);
+        NSString *shader = @(key);
+        os_unfair_lock_lock(&lk); BOOL fresh = ![seen containsObject:shader]; if (fresh) [seen addObject:shader]; os_unfair_lock_unlock(&lk);
+        if (!fresh) continue;
+        int stage = (int)st;
+        dispatch_async(q, ^{ @autoreleasepool {
+            for (NSString *v in totk_rt_known_variants(shader)) {
+                NSString *pc = [v stringByAppendingString:@"_b"];
+                if (warm_failed(pc)) continue;
+                atomic_fetch_add(&g_pf_queued, 1);
+                dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
+                uint64_t t0 = bp_now(); NvShader *sh = warm_shader_load(pc, stage); uint64_t dt = bp_now() - t0;
+                dispatch_semaphore_signal(slots);
+                if (!sh) { warm_fail(pc); continue; }
+                WarmItem *item = [WarmItem new]; item->kind = 0; item->key = pc; item->shader = sh; warm_enqueue(item);
+                atomic_fetch_add(&g_pf_built, 1); atomic_fetch_add(&g_pf_ns, dt);
+            }
+            uint64_t now = bp_now(), last = atomic_load(&g_pf_last);
+            if (now - last > 5000000000ull && atomic_compare_exchange_strong(&g_pf_last, &last, now))
+                MLOG("[prefetch] 累计：程序 %llu 个，排队编着色器 %llu 个，编好 %llu 个，后台共 %.0f ms",
+                     (unsigned long long)g_pf_progs, (unsigned long long)g_pf_queued, (unsigned long long)g_pf_built, g_pf_ns / 1e6);
+        } });
+    }
 }
 /* Count the exact manifest rows and cached variants this run will visit before
    displaying a determinate bar. Shader/PSO counts are separate: one pipeline
@@ -7639,6 +7886,75 @@ static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl);
 // 通道实际挂不挂深度 / 模板要到回放时才定（纯深度 / 纯模板 / 都不挂的省略），所以每种可能的挂法各算一条键——猜多了只是后台白编，不影响结果。
 // Prediction for parallel precompilation (see the note before pso_get): scan from after the current operation to the end of this submit, replaying only state; at a draw, compute the pipeline key from "the state at that time + that render pass's attachment formats" and dispatch those not yet built to the background.
 // Whether a render pass actually attaches depth / stencil is only decided at replay (depth-only / stencil-only / neither attached are omitted), so one key is computed for each possible attach mode -- guessing too many only means wasted background compiles and does not affect the result.
+/* Urgent shaders (async shaders, Mac; TOTK_SHADER_PREDICT=0 off). A draw that cannot be skipped (it stores, writes depth
+   inside an occlusion count, ...) needs its variant and Metal library before it is drawn. Its job is usually queued in
+   the background already (the planning scans meet programs first), behind the jobs of draws that can be skipped, so the
+   submit thread took it back and translated and compiled it itself, one after another: an area entered by flying took
+   157 of them in 13 frames, 6.3 s compiling libraries and 1.6 s translating (2026-10-22, empty cache, no seed). The
+   first time a submission meets a shader that is not ready, the rest of it is scanned (state replayed, nothing drawn,
+   like pso_predict_rest): the draws that will not be skippable get their jobs run at once on the urgent translators
+   (totk_rt_variant may_defer 2), programs met for the first time are made with every stage in the background
+   (g_prog_prefetch), and the other new variants are queued as usual. Those draws then wait in parallel. A scan that ends
+   on its budget (TOTK_SHADER_PREDICT_SCAN commands, 8192; TOTK_SHADER_PREDICT_US, 2000) may run again from the next
+   miss, up to 16 per submission. */
+static uint64_t g_sp_mark, g_sp_scans, g_sp_ns, g_sp_progs, g_sp_urgent, g_sp_queued; static int g_sp_n, g_sp_more;
+static void shader_predict_rest(void) {
+    static int enabled = -1, max_ops, max_us;
+    if (enabled < 0) {
+        const char *e = getenv("TOTK_SHADER_PREDICT"); enabled = !e || atoi(e);
+        e = getenv("TOTK_SHADER_PREDICT_SCAN"); max_ops = e ? atoi(e) : 8192; if (max_ops < 1) max_ops = 1;
+        e = getenv("TOTK_SHADER_PREDICT_US"); max_us = e ? atoi(e) : 2000; if (max_us < 1) max_us = 1;
+        MLOG("[shader-predict] %s", enabled ? "on: the shaders of draws further on that cannot be skipped are prepared at once, in parallel" : "off");
+    }
+    if (!enabled || !g_exec_next) return;
+    static typeof(S) Ssave; memcpy(&Ssave, &S, sizeof S); typeof(R) Rsave = R;
+    int pso_dirty = g_pso_dirty, dss_dirty = g_dss_dirty, for_draw = g_prog_for_draw; g_prog_for_draw = 0;
+    fz_cursor cur = {.p = g_exec_next};
+    uint64_t started = bp_now(), progs = 0, urgent = 0, queued = 0; int guard = 0, stop = 0;
+    for (; ; guard++) {
+        if (guard >= max_ops || (!(guard & 63) && bp_now() - started > (uint64_t)max_us * 1000ull)) { stop = 1; break; }   // the clock every 64 commands
+        const uint8_t *q; op_hdr hq; const void *aq;
+        if (!fz_next(&cur, &q, &hq, &aq)) break;
+        if (hq.op == OP_SET_RT) { R.rt = *(const p_set_rt *)aq; R.has_rt = 1; continue; }   // the fragment outputs' types are answered from the targets
+        if (hq.op == OP_DRAW || hq.op == OP_DRAW_IDX) {
+            const prog_t *p = S.prog; if (!p) continue;
+            NvProg *pr = p->serial ? (__bridge NvProg *)serial_ptr(p->serial) : nil;
+            if (!pr) { g_prog_prefetch = 1; pr = prog_get(p); g_prog_prefetch = 0; progs++; }
+            if (!pr) continue;
+            int must = pr->keeps || !draw_state_may_skip();
+            for (int st = 0; st < 2; st++) {
+                if (!pr->key[st]) continue;
+                if (pr->missing >> st & 1) {   // its job is in the background line
+                    if (must && !totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), rt_local(pr->ctl[st], st), 2)) urgent++;
+                    continue;
+                }
+                if (!pr->sh[st]) continue;
+                uint64_t sg = stage_sig(st);
+                if (sg == pr->sig[st] || pr->alt[st][@(sg)]) continue;
+                if (!totk_rt_variant(pr->key[st], st, pr->ctl[st], pr->code[st], rt_answers(st), nil, must ? 2 : 1)) { if (must) urgent++; else queued++; }
+            }
+            continue;
+        }
+        if (hq.op == OP_CLEAR_COLOR || hq.op == OP_CLEAR_DS || hq.op == OP_RENDER_COND) continue;
+        state_op(hq.op, aq);
+    }
+    memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty; g_prog_for_draw = for_draw;
+    g_sp_more = stop;
+    g_sp_scans++; g_sp_ns += bp_now() - started; g_sp_progs += progs; g_sp_urgent += urgent; g_sp_queued += queued;
+    if ((progs || urgent || queued) && (g_sp_scans <= 20 || g_sp_scans % 100 == 0)) {
+        uint64_t un, uns; totk_rt_urgent_stats(&un, &uns);
+        MLOG("[shader-predict] scan %llu (%d commands%s): %llu new programs, %llu urgent, %llu queued in %.2f ms; in all %llu programs, %llu urgent, %llu queued, %.1f ms over %llu scans; urgent jobs done %llu, %.1f ms each from queued to recorded",
+             (unsigned long long)g_sp_scans, guard, stop ? ", budget" : "", (unsigned long long)progs, (unsigned long long)urgent, (unsigned long long)queued, (bp_now() - started) / 1e6,
+             (unsigned long long)g_sp_progs, (unsigned long long)g_sp_urgent, (unsigned long long)g_sp_queued, g_sp_ns / 1e6, (unsigned long long)g_sp_scans,
+             (unsigned long long)un, un ? uns / 1e6 / (double)un : 0.0);
+    }
+}
+static void shader_predict_maybe(void) {
+    if (!async_shaders() || !g_exec_next) return;
+    if (g_sp_mark != g_sub_serial) { g_sp_mark = g_sub_serial; g_sp_n = 0; g_sp_more = 1; }
+    if (!g_sp_more || g_sp_n >= 16) return;
+    g_sp_n++; shader_predict_rest();
+}
 static void pso_predict_rest(void) {
     static int enabled = -1; if (enabled < 0) { const char *e = getenv("TOTK_PSO_PREDICT"); enabled = !e || atoi(e); }
     if (!enabled) return;
@@ -7649,7 +7965,7 @@ static void pso_predict_rest(void) {
     enum { QN = 160 }; static int max_ops = -1, max_keys, max_us;
     if (max_ops < 0) {
         const char *e = getenv("TOTK_PSO_PREDICT_SCAN"); int ops = e ? atoi(e) : 8192;
-        e = getenv("TOTK_PSO_PREDICT_KEYS"); max_keys = e ? atoi(e) : 32; if (max_keys < 1) max_keys = 1; if (max_keys > QN) max_keys = QN;
+        e = getenv("TOTK_PSO_PREDICT_KEYS"); max_keys = e ? atoi(e) : 64; if (max_keys < 1) max_keys = 1; if (max_keys > QN) max_keys = QN;
         e = getenv("TOTK_PSO_PREDICT_US"); max_us = e ? atoi(e) : 2000; if (max_us < 1) max_us = 1;
         max_ops = ops < 1 ? 1 : ops;
         MLOG("[totk] pipeline prediction: after a submission's first pipeline miss, scans at most %d commands, %d keys, %d us", max_ops, max_keys, max_us);
@@ -7664,7 +7980,7 @@ static void pso_predict_rest(void) {
     for (; ; guard++) {
         if (guard >= max_ops) { stop = 1; break; }
         if (na >= max_keys) { stop = 2; break; }
-        if (bp_now() - started > (uint64_t)max_us * 1000ull) { stop = 3; break; }
+        if (!(guard & 63) && bp_now() - started > (uint64_t)max_us * 1000ull) { stop = 3; break; }   // the clock every 64 commands
         const uint8_t *q; op_hdr hq; const void *aq;
         if (!fz_next(&cur, &q, &hq, &aq)) break;
         if (hq.op == OP_SET_RT) {
@@ -7688,6 +8004,8 @@ static void pso_predict_rest(void) {
                 if (!pred_guess_wanted(v, dfull, sfull, fs)) continue;
                 pso_key k; pso_key_fill(&k, vs, fs, cf, PRED_DEPTH[v] ? dfull : 0, PRED_STENCIL[v] ? sfull : 0, samples, 0);
                 if (hm_get_id(&g_pso, &k)) continue;
+                pthread_mutex_lock(&g_pp_mu); int pending = pso_pend_find(&k) >= 0; pthread_mutex_unlock(&g_pp_mu);
+                if (pending) continue;   // kicked by an earlier scan of this submission: not a key of this scan's budget
                 int dup = 0; for (int i = 0; i < (v ? nb : na) && !dup; i++) dup = !memcmp(&(v ? qb : qa)[i].k, &k, sizeof k);
                 if (dup) continue;
                 if (!v && na < max_keys) { qa[na].k = k; qa[na].vs = (__bridge void *)vs; qa[na].fs = (__bridge void *)fs; na++;
@@ -7704,14 +8022,15 @@ static void pso_predict_rest(void) {
     memcpy(&S, &Ssave, sizeof S); R = Rsave; args_dirty_all(); g_pso_dirty = pso_dirty; g_dss_dirty = dss_dirty;
     static int logged; if (g_pp_kicked > (uint64_t)kicked0 && logged++ < 20) MLOG("并行预编：本次提交余下 %d 次绘制，丢给后台 %d 条管线", draws, (int)g_pp_kicked - kicked0);
     g_pp_scans++; g_pp_scan_ns += bp_now() - started; if (stop) g_pp_stop[stop - 1]++;
+    g_pp_more = stop != 0;
     if (g_pp_scans % 100 == 0) {
         pthread_mutex_lock(&g_pp_mu); uint64_t full = g_pp_full, freed = g_pp_reclaimed, waits = g_pp_waits, wait_ns = g_pp_wait_ns; int busy = 0;
         for (int i = 0; i < PSO_PEND_MAX; i++) busy += g_pp[i].used; pthread_mutex_unlock(&g_pp_mu);
-        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
+        MLOG("并行预编 至提交 %llu：扫描 %llu 次（平均 %.2f ms；到上限：命令 %llu、键 %llu、时间 %llu），后台开编 %llu 条，绘制领用 %llu 条（等后台 %llu 次共 %.1f ms），提交线程同步编 %llu 条，表满没收 %llu 条，回收没用上的 %llu 条，表里现有 %d 条",
              (unsigned long long)g_sub_serial, (unsigned long long)g_pp_scans, g_pp_scan_ns / 1e6 / (double)g_pp_scans,
              (unsigned long long)g_pp_stop[0], (unsigned long long)g_pp_stop[1], (unsigned long long)g_pp_stop[2],
              (unsigned long long)g_pp_kicked, (unsigned long long)g_pp_taken, (unsigned long long)waits, wait_ns / 1e6,
-             (unsigned long long)full, (unsigned long long)freed, busy);
+             (unsigned long long)g_pp_sync, (unsigned long long)full, (unsigned long long)freed, busy);
     }
 }
 
@@ -7724,6 +8043,7 @@ void dm_nvn_probe_prediction(void) {
     R.sc = (p_scissor){3, 5, 7, 11}; R.has_sc = 0;
     g_exec_next = (const uint8_t *)&ops;
     pso_predict_rest();
+    shader_predict_rest(); // the shader look-ahead must also restore active scissor/state
     p_scissor expected = {3, 5, 7, 11};
     if (R.has_sc || memcmp(&R.sc, &expected, sizeof expected)) MDIE("pipeline prediction changed active scissor");
     struct {op_hdr h;p_render_cond c;op_hdr end;} cond={{OP_RENDER_COND,8+sizeof(p_render_cond)},{0},{OP_END,8}};
@@ -9669,10 +9989,11 @@ static int mfxup_draw(NvProg *pr) {
 #include "nvn_cube_group.h"
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
-    __unsafe_unretained NvProg *pr = prog_get(S.prog);
-    if (pr && pr->missing) { g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet
+    g_prog_for_draw = 1; __unsafe_unretained NvProg *pr = prog_get(S.prog); g_prog_for_draw = 0;
+    if (pr && pr->missing && async_shaders()) { shader_predict_maybe(); prog_resolve(pr, draw_may_skip(pr)); }
+    if (pr && pr->missing) { async_skip_targets(); g_draw_skip[15]++; return; }   // TOTK (iOS): a stage is not translated yet; Mac (async shaders): still in the background
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
-    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
+    { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { async_skip_targets(); g_draw_skip[15]++; return; } if (fit) g_pso_dirty = 1; }
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
     geometry_dump(pr, dw, di);
     if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
@@ -9865,6 +10186,7 @@ frz_plain:;
     if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial) { cur_ps = pso_get(pr, nil); cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps; }
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // 下一次绘制重新按自身情况取 | The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
+    if (!ps && g_pso_deferred) { g_draw_skip[15]++; return; }   // async shaders: the pipeline is compiling in the background
     if (!ps) { g_draw_skip[9]++; static int failed_n; if (failed_n++ < 3) MLOG("[pipeline-draw] rt-depth=%p serial=%llu fmt=%#x pass-depth=%u dt=%u dw=%u fs-depth=%d", R.rt.depth, (unsigned long long)(R.rt.depth ? R.rt.depth->serial : 0), R.rt.depth ? R.rt.depth->d.format : 0, g_pass.dfmt, S.ds.dt, S.ds.dw, pr->sh[1] ? pr->sh[1]->writes_depth : 0); return; }
     if (ps != g_enc_pso) { enc_r_pso(en, ps); g_enc_pso = ps; }
     static id<MTLDepthStencilState> cur_ds; static uint64_t cur_ds_pass;
@@ -10270,6 +10592,63 @@ static void copy_t2b(const p_copy_b2t *c) {
 }
 // CPU 读贴图（ReadTexels）：预排布贴图以池内存为真值，解排布直读；其余从 MTLTexture blit 读回（调用方已按 NVN 规矩等过 GPU）
 // CPU texture read (ReadTexels): for packaged textures the pool memory is the ground truth, de-layout and read directly; the rest are read back from the MTLTexture by blit (the caller has already waited for the GPU per NVN rules)
+/* GPU region conversion avoids a full-level CPU decode/encode for small texel access.
+   Completion is synchronous: CPU results and guest pool mirrors are visible before returning.
+   Caller-owned pool/texture lifetimes and NVN synchronization requirements are unchanged. */
+static _Atomic uint64_t g_texels_gpu_reads,g_texels_gpu_writes,g_texels_gpu_bytes,g_texels_gpu_failures;
+void mtl_texels_gpu_report(void) {
+    MLOG("[texels-gpu] reads=%llu writes=%llu bytes=%llu failures=%llu",
+         (unsigned long long)atomic_load(&g_texels_gpu_reads),(unsigned long long)atomic_load(&g_texels_gpu_writes),
+         (unsigned long long)atomic_load(&g_texels_gpu_bytes),(unsigned long long)atomic_load(&g_texels_gpu_failures));
+    fflush(stderr);
+}
+static int texels_gpu_region(const tex_t *t,unsigned level,unsigned layer0,const NVNcopyRegion *r,
+                             void *cpu,size_t row,size_t img,int to_linear) { @autoreleasepool {
+    static int enabled; static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("TOTK_TEXELS_GPU"); enabled = !(e && !strcmp(e,"0")); });
+    if(!enabled||!g_nvn_deswz_gpu||nogpu()||nvn_tex_is_linear(&t->d)||!cpu||level>=32||
+       r->xoffset<0||r->yoffset<0||r->zoffset<0||r->width<=0||r->height<=0||r->depth<0)return 0;
+    int bw,bh,bpb=nvn_fmt_bpb(t->d.format,&bw,&bh),is3d=t->d.target==2,nz=r->depth?r->depth:1;
+    if(!bpb||r->xoffset%bw||r->yoffset%bh)return 0;
+    uint64_t wb=((uint64_t)r->width+bw-1)/bw*bpb,hb=((uint64_t)r->height+bh-1)/bh;
+    uint64_t x=(uint64_t)r->xoffset/bw*bpb,y=(uint64_t)r->yoffset/bh;
+    if(wb>UINT32_MAX||hb>UINT32_MAX||x>UINT32_MAX||y>UINT32_MAX||row<wb||hb>SIZE_MAX/row||img<row*hb)return 0;
+    uint32_t fullrow,fullrows,slices,bpb_;unsigned th,td;uint64_t base;
+    unsigned first=is3d?0:layer0+(unsigned)r->zoffset;
+    if((!is3d&&((uint64_t)layer0+r->zoffset+nz>t->L.layers))||
+       nvn_deswizzle_geom(&t->d,level,first,&fullrow,&fullrows,&slices,&base,&th,&td,&bpb_)||
+       x+wb>fullrow||y+hb>fullrows||(is3d&&(uint64_t)r->zoffset+nz>slices))return 0;
+    uint64_t full=(uint64_t)fullrow*fullrows;
+    if(slices&&full>UINT64_MAX/slices)return 0;
+    full*=slices;if(full<(1u<<20))return 0; /* Avoid a GPU rendezvous for a cheap small-level CPU copy. */
+    if(hb>SIZE_MAX/wb||wb*hb>SIZE_MAX/(unsigned)nz)return 0;
+    size_t tight_img=(size_t)(wb*hb),total=tight_img*(unsigned)nz;
+    uint64_t cpu_span=(hb-1)*row+wb;
+    if((uint64_t)(nz-1)>(UINT64_MAX-cpu_span)/img)return 0;
+    cpu_span+=(uint64_t)(nz-1)*img;
+    uintptr_t cp=(uintptr_t)cpu,pool=(uintptr_t)t->mem;
+    if(cpu_span>UINTPTR_MAX-cp||t->L.size>UINTPTR_MAX-pool)return 0;
+    if(cp<pool+t->L.size&&pool<cp+cpu_span)return 0; /* Preserve CPU overlap/order behavior through the old path. */
+    void *mb;uint64_t mo;if(!mtl_addr((uint64_t)t->mem,t->L.size,&mb,&mo))return 0;
+    id<MTLBuffer> linear=[g_dev newBufferWithLength:total options:MTLResourceStorageModeShared];
+    if(!linear){atomic_fetch_add(&g_texels_gpu_failures,1);return 0;}
+    if(!to_linear)for(int z=0;z<nz;z++)for(size_t j=0;j<hb;j++)
+        memcpy((uint8_t *)linear.contents+(size_t)z*tight_img+j*wb,(const uint8_t *)cpu+(size_t)z*img+j*row,(size_t)wb);
+    id<MTLCommandBuffer> cb=q_cb();id<MTLComputeCommandEncoder> ce=[cb computeCommandEncoder];
+    int ok=ce!=nil;
+    for(int z=0;ok&&z<(is3d?1:nz);z++)
+        ok=nvn_texels_gpu_encode(ce,(__bridge id<MTLBuffer>)mb,mo,&t->d,level,is3d?0:first+z,
+             (uint32_t)x,(uint32_t)y,is3d?(uint32_t)r->zoffset:0,(uint32_t)wb,(uint32_t)hb,is3d?(uint32_t)nz:1,
+             linear,(uint64_t)z*tight_img,(size_t)wb,tight_img,to_linear)==0;
+    [ce endEncoding];
+    if(!ok){atomic_fetch_add(&g_texels_gpu_failures,1);return 0;}
+    cb_commit(cb);cb_wait(cb);
+    if(cb.status!=MTLCommandBufferStatusCompleted){atomic_fetch_add(&g_texels_gpu_failures,1);return 0;}
+    if(to_linear)for(int z=0;z<nz;z++)for(size_t j=0;j<hb;j++)
+        memcpy((uint8_t *)cpu+(size_t)z*img+j*row,(const uint8_t *)linear.contents+(size_t)z*tight_img+j*wb,(size_t)wb);
+    atomic_fetch_add(to_linear?&g_texels_gpu_reads:&g_texels_gpu_writes,1);atomic_fetch_add(&g_texels_gpu_bytes,total);
+    return 1;
+} }
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     xv_check(t->serial, level, layer0, "CPU读回");
     PD("U cpu_read ser=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d dst=%p row=%lu img=%lu", t->serial, level, layer0, r->xoffset, r->yoffset, r->zoffset, r->width, r->height, r->depth, dst, (unsigned long)row, (unsigned long)img);
@@ -10285,6 +10664,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     TILELOG(t, "ReadTexels lv%u xy=%d,%d %dx%d (%s)", level, r->xoffset, r->yoffset, r->width, r->height, gpu_content ? "from the GPU texture" : tex_mirrored(t) ? "from the pool bytes" : "GPU texture");
     if (gpu_content) { static int n; if (++n <= 8) MLOG("[texels] ReadTexels ser=%llu %ux%u nvnfmt=%#x lv%u: rendered by the GPU, read back from the Metal texture (%d so far)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, level, n); }
     if (tex_mirrored(t) && !gpu_content) {
+        if (texels_gpu_region(t,level,layer0,r,dst,row,img,1)) return;
         uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u), lz = is3d ? MAX(t->d.depth >> level, 1u) : 1;
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
         uint8_t *lin = malloc(lp * lr * lz);
@@ -10321,18 +10701,20 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     if ((uint32_t)(r->xoffset + r->width) > lw || (uint32_t)(r->yoffset + r->height) > lh || (is3d && (uint32_t)(r->zoffset + nz) > lz)) die("WriteTexels: region outside level %u", level);
     TILELOG(t, "WriteTexels lv%u xy=%d,%d %dx%d owned %d mirrored %d flags=%#x pbh=%d tileH=%u size=%llu", level, r->xoffset, r->yoffset, r->width, r->height, gpu_owned(t->serial), tex_mirrored(t), t->d.flags, t->d.pkg_block_h, t->L.tileH, (unsigned long long)t->L.size);
     if (tex_mirrored(t)) {
-        size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
-        uint8_t *lin = malloc(lp * lr * lz);
-        if (!lin) die("WriteTexels: out of memory");
         dm_guest_write_prepare(t->mem, t->L.size);
-        for (int z = 0; z < nz; z++) {
-            unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
-            if ((is3d && z == 0) || !is3d) if (nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) die("WriteTexels: unsupported layout");
-            uint8_t *dst = lin + (is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
-            for (size_t y = 0; y < hb; y++) memcpy(dst + (y0 + y) * lp + x0, src + z * img + y * row, wb);
-            if (!is3d || z == nz - 1) if (nvn_swizzle(&t->d, level, layer, lin, lp, t->mem)) die("WriteTexels: unsupported layout");
+        if (!texels_gpu_region(t,level,layer0,r,(void *)src,row,img,0)) {
+            size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
+            uint8_t *lin = malloc(lp * lr * lz);
+            if (!lin) die("WriteTexels: out of memory");
+            for (int z = 0; z < nz; z++) {
+                unsigned layer = is3d ? 0 : layer0 + r->zoffset + z;
+                if ((is3d && z == 0) || !is3d) if (nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) die("WriteTexels: unsupported layout");
+                uint8_t *dst = lin + (is3d ? (size_t)(r->zoffset + z) * lp * lr : 0);
+                for (size_t y = 0; y < hb; y++) memcpy(dst + (y0 + y) * lp + x0, src + z * img + y * row, wb);
+                if (!is3d || z == nz - 1) if (nvn_swizzle(&t->d, level, layer, lin, lp, t->mem)) die("WriteTexels: unsupported layout");
+            }
+            free(lin);
         }
-        free(lin);
         /* TOTK: a mirrored texture the GPU has rendered into is never re-uploaded from its pool bytes (tex_mtl), so the
            write goes into the MTLTexture as well (below); the pool bytes stay in step for texture objects created later. */
         if (!gpu_owned(t->serial)) return;
@@ -13963,3 +14345,5 @@ int mtl_probe_arg_epoch(void) {
 
 #include "nvn_pool_retire_probe.h"
 #include "nvn_cube_group_probe.h"
+
+#include "nvn_texels_region_probe.h"
