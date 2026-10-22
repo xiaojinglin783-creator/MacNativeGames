@@ -6,7 +6,9 @@
 
 static inline int totk_power_defaults(int metal3) {
     const char *mode = getenv("TOTK_POWER_MODE");
-    int balanced = mode ? !strcmp(mode, "balanced") : metal3;
+    /* Keep the previously working launch policy unless explicitly requested.
+       Disabling keepalive has not passed real-game stability validation. */
+    int balanced = mode && !strcmp(mode, "balanced");
     if (!balanced) return 0;
     setenv("TOTK_MAX_FPS", "60", 0);
     setenv("TOTK_GPU_KEEPALIVE", "0", 0);

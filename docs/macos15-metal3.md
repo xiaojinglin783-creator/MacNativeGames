@@ -355,14 +355,26 @@ the texel-region path are enabled by default; compare the same combat/traversal
 route with the window in front and report actual long-frame logs. Neither the
 Linux checks nor a successful GPU probe guarantee that every scene is stutter-free.
 
-### 2026-10-22: 60 FPS launcher defaults for reduced excess work
+### 2026-10-22: experimental 60 FPS launch policy (opt-in)
 
-The packaged Metal 3 launcher now defaults to `TOTK_POWER_MODE=balanced`:
+The packaged launcher retains its previous launch policy on both backends.
+Explicit `TOTK_POWER_MODE=balanced` requests the experimental defaults:
 `TOTK_MAX_FPS=60`, `TOTK_GPU_KEEPALIVE=0`, `TOTK_ARG_EPOCH=1`, and
 `TOTK_M3_RESOURCE_CACHE=1`. These are defaults only: an explicitly supplied value
-wins. `TOTK_POWER_MODE=performance` restores the previous launch policy (no new
-defaults), and Metal 4 keeps its previous defaults unless balanced mode is
-explicitly requested. The launcher logs the effective ceiling and keepalive value.
+wins. An unset mode or `TOTK_POWER_MODE=performance` retains the previous launch
+policy (no new defaults). The launcher logs the effective ceiling and keepalive
+value when balanced mode is explicitly requested.
+
+Native Mac graphics compilation, GPU binding smoke tests, async shader tests and
+power-policy tests passed, and packaging succeeded. Subsequent gameplay reports
+included exits with balanced mode and again with only keepalive disabled. One
+captured exit is SIGSEGV in the rewritten 1.4.3 main at `0x2b8464`, accessing
+`0x0070716263900090`; this does not establish that keepalive is the root cause.
+The previous performance policy was reported to run successfully. Balanced mode
+is therefore no longer enabled automatically, pending diagnosis and gameplay
+validation. Existing packages need a rebuild to adopt the restored default; use
+the explicit performance command below in the meantime. Do not paper over this
+fault by ignoring the memory access or changing game data.
 
 This is a render ceiling, not a new guest clock. Previously the default uncapped
 clock could run at 120 Hz while a 60 Hz screen showed the latest image and discarded
@@ -390,12 +402,13 @@ Linux validation: 106 tests, 94 passed and 12 skipped for unavailable platforms 
 tools. Both graphics backend audits, shell syntax and Make dry runs pass. The C
 probe checks parsing/overrides, preservation of Metal 4 defaults, the real pacer
 with two swapchain images over 600 frames, no halving of 60 to 30, and no extra
-slowdown when CPU work already exceeds the target. Native Mac compilation,
-observed frame pacing and actual thermal effects remain pending.
+slowdown when CPU work already exceeds the target. Native checks and packaging
+also passed, but neither establishes crash-free gameplay or a thermal benefit.
 
 Quit the game, pull this branch, and run `bash games/totk/scripts/check_macos_backend.sh 3`.
 After that succeeds, rebuild using the existing `build_app.py` command and output
-path. The existing wrapper will pick up the defaults on its next launch. Verify:
+path. The existing wrapper will retain the prior policy on its next launch.
+Do not opt into balanced mode while diagnosing the reported exits. To inspect logs:
 
 ```sh
 grep -E '\[power\]|GPU 保活|计时 至帧|上屏节奏' \
@@ -413,3 +426,8 @@ TOTK_POWER_MODE=performance TOTK_FACE_BUTTONS=position \
 
 Fanless hardware can still become warm at 60 FPS; these code changes are not a
 promise of low surface temperature or a guaranteed FPS increase.
+
+For guest fault diagnosis, `scripts/diagnose_guest_fault.py` reads at most 52 bytes
+around each requested offset from a local rewritten module and prints instruction
+words, with disassembly when Capstone is available in the build virtualenv. It
+never executes or modifies the module, and does not access keys, saves or fonts.

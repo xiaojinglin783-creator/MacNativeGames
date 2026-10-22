@@ -47,11 +47,15 @@ int main(void) {
     uint64_t slow=simulate(1000000,nvn_frame_limit_period(1000000000ull/30,60,1,0));
     assert(slow>=598ull*(1000000000ull/30));
     reset(); assert(!totk_power_defaults(0)); assert(!getenv("TOTK_MAX_FPS"));
-    reset(); assert(totk_power_defaults(1));
+    reset(); assert(!totk_power_defaults(1));
+    assert(!getenv("TOTK_MAX_FPS") && !getenv("TOTK_GPU_KEEPALIVE"));
+    assert(!getenv("TOTK_ARG_EPOCH") && !getenv("TOTK_M3_RESOURCE_CACHE"));
+    reset(); setenv("TOTK_POWER_MODE","balanced",1); assert(totk_power_defaults(1));
     assert(!strcmp(getenv("TOTK_MAX_FPS"),"60"));
     assert(!strcmp(getenv("TOTK_GPU_KEEPALIVE"),"0"));
     assert(!strcmp(getenv("TOTK_ARG_EPOCH"),"1"));
-    reset(); setenv("TOTK_MAX_FPS","90",1); setenv("TOTK_GPU_KEEPALIVE","1",1);
+    reset(); setenv("TOTK_POWER_MODE","balanced",1);
+    setenv("TOTK_MAX_FPS","90",1); setenv("TOTK_GPU_KEEPALIVE","1",1);
     setenv("TOTK_ARG_EPOCH","0",1); assert(totk_power_defaults(1));
     assert(!strcmp(getenv("TOTK_MAX_FPS"),"90"));
     assert(!strcmp(getenv("TOTK_GPU_KEEPALIVE"),"1"));
